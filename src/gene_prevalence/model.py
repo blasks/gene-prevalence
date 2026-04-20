@@ -51,9 +51,6 @@ class BernoulliPrevalenceModel:
         :meth:`estimate_prevalence`.
     variance_ : pd.Series
         Estimated variances, created after calling :meth:`estimate_variance`.
-    confidence_intervals_ : pd.Series
-        Confidence interval widths, created after calling
-        :meth:`confidence_interval`.
     """
 
     def __init__(self, data, lambdas, clip_max=1.0):
@@ -61,6 +58,24 @@ class BernoulliPrevalenceModel:
         self.lambdas = lambdas
         self.clip_max = clip_max
         self._validate_inputs()
+
+    @property
+    def pi_estimates_(self):
+        """
+        Return stored prevalence estimates, clipping on access when requested.
+
+        Raises
+        ------
+        AttributeError
+            If prevalence estimates have not been computed or assigned.
+        """
+        if not hasattr(self, "_pi_estimates"):
+            raise AttributeError("pi_estimates_ has not been computed yet.")
+
+        if self.clip_max is None:
+            return self._pi_estimates
+
+        return self._pi_estimates.clip(upper=self.clip_max)
 
     def _validate_inputs(self):
         """
@@ -92,31 +107,27 @@ class BernoulliPrevalenceModel:
         gene family ``j`` in genome ``i``, and ``\\lambda_i`` is the
         completeness of genome ``i``.
 
-        If ``clip_max`` is not ``None``, the resulting estimates are clipped
-        above at ``clip_max``.
-
         Returns
         -------
         pd.Series
-            A series of prevalence estimates indexed by gene family. The same
-            values are also stored on ``self.pi_estimates_``.
+            A series of prevalence estimates indexed by gene family. Raw
+            values are stored internally and returned through
+            ``self.pi_estimates_`` with clipping applied on access.
         """
         inverse_lambdas = 1 / self.lambdas
         weighted_data = self.data.multiply(inverse_lambdas, axis=1)
         pi_estimates = weighted_data.mean(axis=1)
 
-        if self.clip_max is not None:
-            pi_estimates = pi_estimates.clip(upper=self.clip_max)
-
-        self.pi_estimates_ = pi_estimates
+        self._pi_estimates = pi_estimates
         return self.pi_estimates_
 
     def estimate_variance(self):
         """
         Estimate and store the variance of each prevalence estimate.
 
-        If ``self.pi_estimates_`` is not already available, this method first
-        calls :meth:`estimate_prevalence`.
+        If prevalence estimates are not already available, this method first
+        calls :meth:`estimate_prevalence`. Variance is computed from the raw
+        stored estimates before any clipping is applied on access.
 
         The variance estimator is:
 
@@ -141,19 +152,20 @@ class BernoulliPrevalenceModel:
         if not hasattr(self, "pi_estimates_"):
             self.estimate_prevalence()
 
+        raw_pi_estimates = self._pi_estimates
         n = len(self.lambdas)
         scaling_factor = 1 / (n**2)
-        pi_lambda_matrix = np.outer(self.pi_estimates_, 1 / self.lambdas) * (
-            1 - np.outer(self.pi_estimates_, self.lambdas)
+        pi_lambda_matrix = np.outer(raw_pi_estimates, 1 / self.lambdas) * (
+            1 - np.outer(raw_pi_estimates, self.lambdas)
         )
         variance = scaling_factor * pi_lambda_matrix.sum(axis=1)
 
-        self.variance_ = pd.Series(variance, index=self.pi_estimates_.index)
+        self.variance_ = pd.Series(variance, index=raw_pi_estimates.index)
         return self.variance_
 
-    def confidence_interval(self, alpha):
+    def confidence_interval(self, alpha, return_ci_widths=False):
         """
-        Estimate and store confidence interval widths for each prevalence estimate.
+        Return confidence interval bounds or widths for each prevalence estimate.
 
         If ``self.variance_`` is not already available, this method first
         calls :meth:`estimate_variance`.
@@ -168,19 +180,24 @@ class BernoulliPrevalenceModel:
 
         - ``\\mathrm{Var}(\\hat{\\pi}_j)`` is the estimated variance of the
           prevalence estimator for gene family ``j``
-        - ``\\alpha`` is the significance level
+        - ``\\alpha`` is the significance level (e.g. for a 95% confidence interval ``\\alpha = 0.05``)
 
         Parameters
         ----------
         alpha : float
             Significance level used to scale the variance estimate. Must
-            satisfy ``0 < alpha < 1``.
+            satisfy ``0 < alpha < 1``. For example, for a 95% confidence interval, 
+            set ``alpha = 0.05``.
+        return_ci_widths : bool, default=False
+            If ``True``, return only the confidence interval widths. When
+            ``False``, return lower and upper confidence bounds.
 
         Returns
         -------
-        pd.Series
-            A series of confidence interval widths indexed by gene family. The
-            same values are also stored on ``self.confidence_intervals_``.
+        pd.Series or tuple[pd.Series, pd.Series]
+            If ``return_ci_widths`` is ``True``, returns a series of
+            confidence interval widths indexed by gene family. Otherwise,
+            returns lower and upper bound series indexed by gene family.
 
         Raises
         ------
@@ -193,5 +210,19 @@ class BernoulliPrevalenceModel:
         if not hasattr(self, "variance_"):
             self.estimate_variance()
 
-        self.confidence_intervals_ = np.sqrt(self.variance_ / alpha)
-        return self.confidence_intervals_
+        ci_widths = np.sqrt(self.variance_ / alpha)
+        if return_ci_widths:
+            return ci_widths
+
+        raw_pi_estimates = self._pi_estimates
+        lower_bounds = (raw_pi_estimates - (ci_widths / 2)).clip(lower=0)
+        upper_bounds = raw_pi_estimates + (ci_widths / 2)
+
+        if self.clip_max is not None:
+            clipped_pi_estimates = self.pi_estimates_
+            upper_bounds = upper_bounds.clip(upper=self.clip_max)
+            lower_bounds = lower_bounds.where(
+                lower_bounds <= clipped_pi_estimates, clipped_pi_estimates
+            )
+
+        return lower_bounds, upper_bounds
