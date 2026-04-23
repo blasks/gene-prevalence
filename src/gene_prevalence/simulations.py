@@ -105,7 +105,8 @@ def build_three_part_pi_vector(
     non_core_span : tuple[float, float], default=(0.0, 1.0)
         Candidate low and high endpoints for the non-core portion of the
         prevalence vector. The two values may be given in either order and are
-        adjusted relative to the delimiter as implemented below.
+        adjusted relative to the delimiter as implemented below. Must be within the 
+        range ``[0, 1]``.
 
     Returns
     -------
@@ -291,11 +292,13 @@ def build_observed_data_matrix(
             n_true_present = true_presence.sum()
             n_to_observe = int(np.round(completeness_value * n_true_present))
             if n_to_observe > 0 and n_true_present > 0:
+                # norm the biases for the present genes to sum to 1 for sampling probabilities
+                normed_biases = biases[true_presence == 1] / biases[true_presence == 1].sum()
                 observed_indices = rng.choice(
                     np.where(true_presence == 1)[0],
                     size=n_to_observe,
                     replace=False,
-                    p=biases[true_presence == 1] / biases[true_presence == 1].sum(), 
+                    p=normed_biases,
                 )
                 observation_mask[observed_indices, col_index] = 1
     else:
