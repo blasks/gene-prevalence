@@ -215,8 +215,8 @@ class BernoulliPrevalenceModel:
             return ci_widths
 
         raw_pi_estimates = self._pi_estimates
-        lower_bounds = (raw_pi_estimates - (ci_widths / 2)).clip(lower=0)
-        upper_bounds = raw_pi_estimates + (ci_widths / 2)
+        lower_bounds = (raw_pi_estimates - ci_widths).clip(lower=0)
+        upper_bounds = raw_pi_estimates + ci_widths
 
         if self.clip_max is not None:
             clipped_pi_estimates = self.pi_estimates_
