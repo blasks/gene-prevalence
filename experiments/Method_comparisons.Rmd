@@ -1,0 +1,891 @@
+---
+title: "Gene Prevalence Estimation"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    theme: flatly
+    highlight: tango
+  pdf_document:
+    toc: true
+---
+
+```{r, include=FALSE}
+start <- Sys.time()
+```
+
+```{r, warning=FALSE, message=FALSE}
+library(tidyverse)
+```
+
+In this file we compare several estimators of gene prevalence for data with independent Bernoulli missingness by consider the mean squared error of these estimates. We then consider methods for constructing confidences intervals based on these estimators and check their nominal coverage and compare their widths. We then check how robust these confidence intervals are to model misspecification, either with errors in the observed completeness parameters or with per-gene bias in the missingness.
+
+# Setup
+
+We observe a binary matrix $X\in\{0,1\}^{n\times p}$ where $n$ is the number of genomes and $p$ is the number of genes.
+
+$$
+X_{ij}=Y_{ij}\cdot Z_{ij}
+$$ where $Y_{ij}\sim\text{Bernoulli}(\pi_j)$ is the true presence/absence of gene $j$ in genome $i$ and $Z_{ij}\sim\text{Bernoulli}(\lambda_i)$ indicates whether gene $j$ is detected in genome $i$. Here, $\lambda_i$ is the known[^1] detection probability for genes within genome $i$.
+
+[^1]: It is estimated based on the proportion of "core genes" that are detected in genome $i$, but we treat it for this analysis as known.
+
+Thus, $X_{ij}\sim\text{Bernoulli}(\lambda_i\pi_j)$.
+
+**Goal:** Estimate the gene prevelances $\pi_j$ for $j=1,\ldots,p$. We assume that the detection probabilities $\lambda_i$ are known for $i=1,\ldots,n$.
+
+```{r, cache = TRUE}
+simulate_data <- function(pi, lambda) {
+  n <- length(lambda)
+  p <- length(pi)
+  Y <- matrix(rbinom(n * p, 1, rep(pi, each = n)), nrow = n, ncol = p)
+  Z <- matrix(rbinom(n * p, 1, rep(lambda, times = p)), nrow = n, ncol = p)
+  list(X = Y * Z, Y = Y, Z = Z)
+}
+```
+
+Let's generate some example data.
+
+```{r, cache = TRUE}
+set.seed(123)
+lambda <- c(rep(1, 40), rep(c(0.8, 0.6, 0.4, 0.2), each = 100))
+pi <- c(rep(1, 1000), rep(0.5, 2500), rep(0.2, 6000), rep(0.01, 500))
+ex1 <- c(
+  simulate_data(pi, lambda),
+  pi = list(pi),
+  lambda = list(lambda)
+  )
+```
+
+# Estimating $\pi_j$
+
+## Unbiased estimator
+
+An unbiased estimate for $\pi_j$ is given by
+
+$$
+\widehat{\pi}_j = \frac1{n} \sum_{i=1}^n \frac1{{\lambda_i}}X_{ij}.
+$$
+
+To see that it is unbiased, note that $\mathbb{E}[X_{ij}]=\pi_j\lambda_i$.
+
+If we like, we can improve this estimator by ensuring it is never above 1 (although we lose unbiasedness by doing so):
+
+```{r, cache = TRUE}
+estimate_pi <- function(X, lambda, clip = FALSE) {
+  pi_hat <- colMeans(X / lambda)
+  if (clip) pi_hat <- pmin(pi_hat, 1)
+  return(pi_hat)
+}
+```
+
+## Maximum Likelihood Estimation of $\pi_j$
+
+An alternative is to consider maximising the likelihood function of each parameter $\pi_j$. Because $p^{X} = p$ if $X = 1$ and $p^X = 1$ if $X = 0$, we can write express the likelihood as:
+
+$$
+\begin{align}
+L( \pi_j \mid X, \lambda ) &= \prod_{i = 1}^n \mathbb{P}( X_{ij} =1 )^{ X_{ij} } \times \mathbb{P}( X_{ij} = 0)^{1 - X_{ij}} \\
+                  &= \prod_{i = 1}^n (\pi_j \lambda_i) ^{ X_{ij} } ( 1 - \pi_j \lambda_i )^{1 - X_{ij}}
+\end{align}
+$$
+We can optimise this directly, or optimise the log-likelihood, which splits the products into sums and the exponents into multiplicative factors.
+
+$$
+\ell( \pi_j \mid X, \lambda ) = \log L( \pi_j \mid X, \lambda ) = \sum_{i = 1}^n X_{ij} \log ( \pi_j \lambda_i)  + ( 1 - X_{ij} ) \log ( 1 - \pi_j \lambda_i )
+$$
+
+We can also finding the maximum by considering the derivative in $\pi_j$, and setting it equal to 0: 
+
+$$
+\sum_{i=1}^n \left[\frac{X_{ij}}{\pi_j} - \lambda_i \frac{1-X_{ij}}{1-\lambda_i\pi_j}\right] = 0.
+$$
+
+Doing any of these optimisations numerically using `uniroot` or `optim` in R to give an estimator $\widehat{\pi}_j^{MLE}$. Note that the log-likelihood can be undefined if $\pi_j \lambda_i = 0$ or $1$, and so in the code below we "pad" the probability matrix with a $10^{-8}$ buffer for numerical stability.  
+
+```{r, cache = TRUE}
+
+add_epsilon <- function(mat, epsilon = 1e-8) {
+    mat[mat == 0] <- epsilon
+    return(mat)
+}
+
+estimate_pi_mle_optim <- function( data, lambdas, hessians = FALSE ) {
+  pi_hats <- rep(0, dim(data)[2] )
+  likelihoods <- rep(0, dim(data)[2] )
+  if (hessians) { hessian_vals <- rep(0, dim(data)[2] )  }
+  for (j in 1:dim(data)[2]) {
+    data_j <- data[,j]
+    nll <- function( pi_j ) {
+      p_mat <- pi_j * lambdas
+      return( - sum( data_j*log(add_epsilon(p_mat)) + (1-data_j)*log(add_epsilon(1-p_mat)))) 
+    }
+    results <- optim( c(0.5),
+                         nll, 
+                         method = "L-BFGS-B",
+                         lower = 0, 
+                         upper = 1,
+                         hessian = hessians)
+    pi_hats[j] <- results$par
+    likelihoods[j] <- results$value
+    if (hessians) {
+      hessian_vals <- results$hessian
+    }
+  }
+  if (hessians) {return(list(pi_hats=pi_hats,values=likelihoods,hessian_vals=hessian_vals))}
+  return(  list( pi_hats = pi_hats, values = likelihoods) )
+}
+
+estimate_pi_mle_ests <- function( data, lambdas ){
+  return( estimate_pi_mle_optim(data, lambdas)$pi_hats )
+}
+```
+
+## Comparing to two baselines
+
+Let's apply these two approaches to our example, and compare to the following baselines:
+
+-   Naive approach: just take the average prevalence across all genomes, both complete and incomplete, and ignore any potential missingness.; and
+-   Standard approach: throw out all incomplete genomes and then estimate $\pi_j$ as the proportion of complete genomes in which gene $j$ is detected. This approach, while unbiased, will usually have higher variance because it does not use all of the information in the incomplete genomes to estimate $\pi_j$.
+
+```{r, cache = TRUE}
+system.time({pi_hat <- estimate_pi(ex1$X, lambda, clip = FALSE)})
+pi_hat_clipped <- estimate_pi(ex1$X, lambda, clip = TRUE)
+pi_hat_naive <- colMeans(ex1$X)
+pi_hat_complete <- colMeans(ex1$X[lambda==1,])
+system.time(pi_hat_mle_optim <- estimate_pi_mle_optim(ex1$X, lambda) )
+```
+
+```{r, cache = TRUE}
+all_pi <- tibble(
+  pi_hat_clipped = pi_hat_clipped,
+  pi_hat_naive = pi_hat_naive,
+  pi_hat_complete = pi_hat_complete,
+  pi_hat_mle_optim = pi_hat_mle_optim$pi_hats,
+  pi_true = ex1$pi)
+all_pi %>%
+  pivot_longer(-pi_true, names_to = "estimator", values_to = "estimate") %>%
+  ggplot(aes(x = pi_true, y = estimate)) +
+  geom_point(alpha = 0.2) +
+  geom_abline(slope = 1, intercept = 0, linetype = "dashed") +
+  facet_wrap(~estimator) +
+  labs(x = "True Prevalence", y = "Estimated Prevalence") +
+  theme_minimal() +
+  coord_equal()
+```
+
+```{r, cache = TRUE}
+all_pi %>%
+  pivot_longer(-pi_true, names_to = "estimator", values_to = "estimate") %>%
+  group_by(estimator, pi_true) %>% 
+  summarize(mse = mean((estimate - pi_true)^2), .groups = "drop") %>%
+  ggplot(aes(x=pi_true, y=mse, color = estimator)) +
+  geom_line() + scale_y_log10()
+```
+
+Overall the MLE is the best performing estimator for most intermediate prevalence genes. Extreme prevalence genes (with $\pi_j$ close to 0 or 1) lead to slightly worse performance for the MLE because this is where it is hardest to account for missingness.\
+
+# Confidence intervals for $\pi_j$
+
+We consider six methods for constructing confidence intervals. Two are simple and based on the lovcation and estimated variance of the unbiased estimator. One is based on the likelihood ratio test and relies on the asymptotics of the likelihood ratio. Two are exact tests based on inverting a permutation test for a hypothesised parameters, one variant of this uses the unbiased estimator and one uses the MLE. Lastly, we consider a bootstrapping approach to form a CI.\
+\
+We consider each of these tests performed on three different subsets of the data: (1) using only the complete genomes (tagged with \_complete); (2) using all of the data; and (3) using the genomes with (observed) completeness at least 0.25 (tagged with \_filtered).
+
+## Normal approximation
+
+The variance of this estimator is given by
+
+$$
+\text{Var}(\widehat{\pi}_j) = \frac1{n^2} \sum_{i=1}^n \frac1{{\lambda_i}} \pi_j(1-\lambda_i\pi_j).
+$$
+
+```{r, cache = TRUE}
+estimate_pi_var <- function(X, lambda, pi_hat) {
+  n <- nrow(X)
+  pi_hat * (sum(1 / lambda) - pi_hat * sum(lambda) ) / n^2
+}
+```
+
+A $100(1-\alpha)\%$ confidence interval for $\pi_j$ can be constructed as
+
+$$
+\widehat{\pi}_j \pm z_{1-\alpha/2} \sqrt{\widehat{\text{Var}}(\widehat{\pi}_j)}.
+$$ Here, $\widehat{\text{Var}}(\widehat{\pi}_j)$ is the plug-in estimator for the variance, obtained by replacing $\pi_j$ with $\widehat{\pi}_j$ in the variance formula.
+
+```{r, cache = TRUE}
+normal_ci <- function(X, lambda, alpha = 0.05) {
+  pi_hat <- estimate_pi(X, lambda)
+  se <- sqrt(estimate_pi_var(X, lambda, pi_hat))
+  z <- qnorm(1 - alpha / 2)
+  list(lower = pi_hat - z * se, upper = pi_hat + z * se)
+}
+
+normal_ci_complete <- function(X, lambda, alpha = 0.05) {
+  normal_ci(X[lambda == 1, ], lambda[lambda == 1], alpha)
+}
+
+normal_ci_filtered <- function(X, lambda, threshold = 0.25, alpha = 0.05) {
+  normal_ci(X[lambda > threshold, ], lambda[lambda  > threshold], alpha)
+}
+
+```
+
+## Chebyshev
+
+Using Chebyshev's inequality, we can construct a confidence interval for $\pi_j$ as $$
+\widehat{\pi}_j \pm \sqrt{\frac{\widehat{\text{Var}}(\widehat{\pi}_j)}{\alpha}}.
+$$ This interval is guaranteed to have coverage of at least $1-\alpha$, regardless of the distribution of $\widehat{\pi}_j$, but it may be overly conservative.
+
+```{r, cache = TRUE}
+chebyshev_ci <- function(X, lambda, alpha = 0.05) {
+  pi_hat <- estimate_pi(X, lambda)
+  half_width <- sqrt(estimate_pi_var(X, lambda, pi_hat) / alpha)
+  list(lower = pi_hat - half_width, upper = pi_hat + half_width)
+}
+
+chebyshev_ci_complete <- function(X, lambda, alpha = 0.05) {
+  chebyshev_ci(X[lambda == 1, ], lambda[lambda == 1], alpha)
+}
+
+chebyshev_ci_filtered <- function(X, lambda, threshold = 0.25, alpha = 0.05) {
+  chebyshev_ci(X[lambda > threshold, ], lambda[lambda  > threshold], alpha)
+}
+```
+
+## Likelihood Ratio Test
+
+We can appeal to the asymptotic of the MLE theory to define the confidence region in terms of the possible parameters $\pi_j$ for which
+
+$$
+ \ell( \widehat{\pi}_j^{MLE} \mid X, \lambda ) - \ell( \pi_j \mid X, \lambda ) < \frac{ q_{1 - \alpha} }{2}
+$$
+
+where $q_{1-\alpha}$ is the $1-\alpha$ quantile of a $\chi_1^2$ distribution. Computationally, we will compute the values of $\ell(\pi \mid X, \lambda)$ on a grid of possible $\pi$ values.
+
+```{r, cache = TRUE}
+lr_ci <- function(X, lambda, alpha = 0.05, pi_grid = seq(0.000, 1.000, by = 0.001)) {
+  ests <- estimate_pi_mle_optim(X, lambda)
+  pi_hats <- ests$pi_hats
+  mle_nllikelihoods <- matrix(ests$values, nrow=length(pi_grid), ncol=dim(X)[2], byrow=TRUE)
+  q <- qchisq(1-alpha, 1)
+
+  nllikelihoods <- matrix( 0, nrow = length( pi_grid ), ncol = dim(X)[2] )
+  
+  for (j in 1:dim(X)[2]) {
+    data_j <- X[,j]
+    nll_j <- function( pi_j ) {
+      p_mat <- pi_j * lambda
+      return( - sum( data_j*log(add_epsilon(p_mat)) + (1-data_j)*log(add_epsilon(1-p_mat)))) 
+    }
+    nllikelihoods[,j] <- sapply( pi_grid, nll_j )
+  }  
+  
+  ci_region_locs <- 2*( nllikelihoods - mle_nllikelihoods ) < q
+  
+  hi <- apply( ci_region_locs * pi_grid, 2, max ) 
+  lo <- apply( ci_region_locs*pi_grid + 5*(1 - ci_region_locs), 2, min )
+  
+  list(lower = lo , upper = hi)
+}
+
+lr_ci_complete <- function(X, lambda, alpha = 0.05) {
+  lr_ci(X[lambda == 1, ], lambda[lambda == 1], alpha)
+}
+
+lr_ci_filtered <- function(X, lambda, threshold = 0.25, alpha = 0.05) {
+  lr_ci(X[lambda > 0.25, ], lambda[lambda > 0.25], alpha)
+}
+```
+
+## Inverting exact test
+
+We use the fact that a confidence interval for $\pi_j$ is the set of all values $\widetilde\pi$ such that a test of $H_0:\pi_j=\widetilde\pi$ vs. $H_a:\pi_j\neq\widetilde\pi$ would not be rejected at level $\alpha$. We can perform this test by computing the test statistic $\widehat\pi_j$ and comparing it to the distribution of $\widehat\pi_j$ under the null hypothesis, which can be obtained by simulating data under $H_0$ (i.e., simulating $X_{ij}\sim\text{Bernoulli}(\lambda_i\widetilde\pi)$ for $i=1,\ldots,n$) and recalculating $\widehat\pi_j$ for each simulated dataset. The confidence interval is then the set of all $\widetilde\pi$ values for which the observed $\widehat\pi_j$ falls within the acceptance region of the test. This is true for any estimator, whether the unbiased or the MLE.
+
+Computational note: Given that the null distribution does not depend on $j$, we can reuse the work across genes when constructing confidence intervals using the inverting exact test method. Along a fine grid of $\widetilde{\pi}$ values, for each draw from the null distribution we can check across all $j$ whether the observed $\widehat\pi_j$ falls within the acceptance region for that $\widetilde{\pi}$ value, and then construct confidence intervals for all genes simultaneously.
+
+```{r, cache = TRUE}
+invert_test_ci <- function(X, lambda, alpha = 0.05,
+                           pi_grid = seq(0.000, 1.000, by = 0.001),
+                           B = 1000, pi_estimator = estimate_pi) {
+  pi_hat <- pmin( pi_estimator(X, lambda), 1)
+  n <- nrow(X)
+  in_ci <- matrix(FALSE, nrow = length(pi_hat), ncol = length(pi_grid))
+  for (k in seq_along(pi_grid)) {
+    pi_tilde <- pi_grid[k]
+    null_pi_hat <- replicate(B, pi_estimator( matrix( rbinom(n, 1, pi_tilde*lambda), ncol = 1 ), lambda ) )
+    lo <- quantile(null_pi_hat, alpha / 2)
+    hi <- quantile(null_pi_hat, 1 - alpha / 2)
+    in_ci[, k] <- pi_hat >= lo & pi_hat <= hi
+  }
+  list(
+    lower = apply(in_ci, 1, function(x) if (any(x)) min(pi_grid[x]) else NA),
+    upper = apply(in_ci, 1, function(x) if (any(x)) max(pi_grid[x]) else NA)
+  )
+}
+
+invert_test_ci_complete <- function(X, lambda, alpha = 0.05,
+                                    pi_grid = seq(0.000, 1.000, by = 0.001),
+                                    B = 1000, pi_estimator = estimate_pi) {
+  invert_test_ci(X[lambda == 1, ], lambda[lambda == 1], alpha, pi_grid, B)
+}
+
+invert_test_ci_filtered <- function(X, lambda, threshold = 0.25, alpha = 0.05,
+                                    pi_grid = seq(0.000, 1.000, by = 0.001),
+                                    B = 1000, pi_estimator = estimate_pi) {
+  invert_test_ci(X[lambda > threshold, ], lambda[lambda > threshold], alpha, pi_grid, B)
+}
+```
+
+## Bootstrap
+
+We can use the non-parametric bootstrap to construct confidence intervals. This involves resampling the rows of $X$ with replacement, recalculating $\widehat{\pi}_j$ for each bootstrap sample, and then using the empirical distribution of these bootstrap estimates to construct confidence intervals (e.g., using the percentile method).
+
+```{r, cache = TRUE}
+bootstrap_ci <- function(X, lambda, alpha = 0.05, B = 1000) {
+  n <- nrow(X)
+  boot_pi_hat <- replicate(B, {
+    idx <- sample(n, replace = TRUE)
+    estimate_pi(X[idx, ], lambda[idx])
+  })
+  list(
+    lower = apply(boot_pi_hat, 1, quantile, probs = alpha / 2),
+    upper = apply(boot_pi_hat, 1, quantile, probs = 1 - alpha / 2)
+  )
+}
+ 
+bootstrap_ci_complete <- function(X, lambda, alpha = 0.05, B = 1000) {
+  bootstrap_ci(X[lambda == 1, ], lambda[lambda == 1], alpha, B)
+}
+
+bootstrap_ci_filtered <- function(X, lambda, threshold = 0.25, alpha = 0.05, B = 1000) {
+  bootstrap_ci(X[lambda > threshold, ], lambda[lambda > threshold], alpha, B)
+}
+```
+
+## Comparing to baseline
+
+In this section, we apply the different CI methods described above to the example data. We also compare to a baseline that only uses complete genomes.
+
+```{r, cache=TRUE}
+
+make_ci_df <- function(ci, method, variant, pi_true) {
+  tibble(
+    pi_true = pi_true,
+    method  = method,
+    variant = variant,
+    ci_lower = ci$lower,
+    ci_upper = ci$upper,
+    covered = pi_true >= ci$lower & pi_true <= ci$upper,
+    length  = ci$upper - ci$lower
+  )
+}
+```
+
+```{r, cache=TRUE}
+run_cis <- function( ex1 ) {
+  
+  print("Normal CIs")
+  print(system.time({ ci_normal             <- normal_ci(ex1$X, ex1$lambda) }))
+  print(system.time({ ci_normal_complete    <- normal_ci_complete(ex1$X, ex1$lambda) }))
+  print(system.time({ ci_normal_filtered    <- normal_ci_filtered(ex1$X, ex1$lambda) }))
+  print("Chebyshev CIs")
+  print(system.time({ ci_chebyshev          <- chebyshev_ci(ex1$X, ex1$lambda) }))
+  print(system.time({ ci_chebyshev_complete <- chebyshev_ci_complete(ex1$X, ex1$lambda) }))
+  print(system.time({ ci_chebyshev_filtered <- chebyshev_ci_filtered(ex1$X, ex1$lambda) }))
+  print("Likelihood Ratio CIs")
+  print(system.time({ ci_lr                 <- lr_ci(ex1$X, ex1$lambda) }))
+  print(system.time({ ci_lr_complete        <- lr_ci_complete(ex1$X, ex1$lambda) }))
+  print(system.time({ ci_lr_filtered        <- lr_ci_filtered(ex1$X, ex1$lambda) }))
+  print("Exact Permutation CIs, using Unbiassed Est")
+  print(system.time({ ci_invert             <- invert_test_ci(ex1$X, ex1$lambda) }))
+  print(system.time({ ci_invert_complete    <- invert_test_ci_complete(ex1$X, ex1$lambda) }))
+  print(system.time({ ci_invert_filtered    <- invert_test_ci_filtered(ex1$X, ex1$lambda) }))
+  print("Exact Permutation CIs, Using MLEs")
+  print(system.time({ ci_invert_mle         <- invert_test_ci(ex1$X, ex1$lambda,
+                                                        pi_estimator = estimate_pi_mle_ests) }))
+  print(system.time({ ci_invert_complete_mle<- invert_test_ci_complete(ex1$X, ex1$lambda,
+                                                                 pi_estimator = estimate_pi_mle_ests) }))
+  print(system.time({ ci_invert_filtered_mle<- invert_test_ci_filtered(ex1$X, ex1$lambda,
+                                                                 pi_estimator = estimate_pi_mle_ests) }))
+  print("Bootstrap CIs")
+  print(system.time({ ci_boot               <- bootstrap_ci(ex1$X, ex1$lambda) }))
+  print(system.time({ ci_boot_complete      <- bootstrap_ci_complete(ex1$X, ex1$lambda) }))
+  print(system.time({ ci_boot_filtered      <- bootstrap_ci_filtered(ex1$X, ex1$lambda) }))
+
+  ci_df <- bind_rows(
+  make_ci_df(ci_normal,                 "normal",      "all",      ex1$pi),
+  make_ci_df(ci_normal_complete,        "normal",      "complete", ex1$pi),
+  make_ci_df(ci_normal_filtered,        "normal",      "fitlered", ex1$pi),
+  make_ci_df(ci_chebyshev,              "chebyshev",   "all",      ex1$pi),
+  make_ci_df(ci_chebyshev_complete,     "chebyshev",   "complete", ex1$pi),
+  make_ci_df(ci_chebyshev_filtered,     "chebyshev",   "fitlered", ex1$pi),
+  make_ci_df(ci_lr,                     "likelihood",  "all",      ex1$pi),
+  make_ci_df(ci_lr_complete,            "likelihood",  "complete", ex1$pi),
+  make_ci_df(ci_lr_filtered,            "likelihood",  "fitlered", ex1$pi),
+  make_ci_df(ci_invert,                 "invert_test", "all",      ex1$pi),
+  make_ci_df(ci_invert_complete,        "invert_test", "complete", ex1$pi),
+  make_ci_df(ci_invert_filtered,        "invert_test", "fitlered", ex1$pi),
+  make_ci_df(ci_invert_mle,             "invert_mle",  "all",      ex1$pi),
+  make_ci_df(ci_invert_complete_mle,    "invert_mle",  "complete",  ex1$pi),
+  make_ci_df(ci_invert_filtered_mle,    "invert_mle",  "fitlered",  ex1$pi),
+  make_ci_df(ci_boot,                   "bootstrap",   "all",      ex1$pi),
+  make_ci_df(ci_boot_complete,          "bootstrap",   "complete", ex1$pi),
+  make_ci_df(ci_boot_filtered,          "bootstrap",   "fitlered", ex1$pi)
+)
+  return(ci_df)
+}
+
+ci_df <- run_cis( ex1 )
+```
+
+The next plot shows that all methods other than `invert_test` with either estimator fail to achieve nominal coverage for the low prevalence genes.
+
+```{r, cache = TRUE}
+ci_df %>%
+  group_by(method, variant, pi_true) %>%
+  summarize(coverage = mean(covered, na.rm = TRUE), 
+            se = sqrt(coverage * (1-coverage) / n()),
+            .groups = "drop") %>%
+  ggplot(aes(x = factor(pi_true), y = coverage, fill = variant)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(aes(ymin = coverage - 2 * se, ymax = coverage + 2 * se),
+                position = position_dodge(width = 0.9), width = 0.25) +
+  geom_hline(yintercept = 0.95, linetype = "dashed") +
+  facet_wrap(~method) +
+  labs(x = "True Prevalence", y = "Coverage", fill = NULL) +
+  theme_minimal()
+```
+
+The next plot shows that in terms of the length of intervals, using all genomes rather than only complete ones leads to shorter intervals except when the true prevalence is 1.
+
+```{r, cache = TRUE}
+ci_df %>%
+  group_by(method, variant, pi_true) %>%
+  summarize(mean_length = mean(length, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = factor(pi_true), y = mean_length, fill = variant)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~method) +
+  labs(x = "True Prevalence", y = "Mean CI Length", fill = NULL) +
+  theme_minimal()
+```
+
+## Genes that are never observed
+
+Part of the reasont that these tests fail to achieve nominal coverage at the low prevalence end is that it is possible to never observe a gene. If we consider the coverage for these tests on only the genes that are observed at least once, and also at least once in the complete genomes, we see that these tests achieve their nominal coverage. It is worth considering how we should treat genes that have not been observed more thoroughly.
+
+```{r, cache=TRUE}
+
+observed_genes <- which(colSums( ex1$X ) > 0)
+row_inds <- sort(as.vector(outer(observed_genes, seq(0, 170000, by = 10000), "+")))
+
+ci_df[row_inds,] %>%
+  group_by(method, variant, pi_true) %>%
+  summarize(coverage = mean(covered, na.rm = TRUE), 
+            se = sqrt(coverage * (1-coverage) / n()),
+            .groups = "drop") %>%
+  ggplot(aes(x = factor(pi_true), y = coverage, fill = variant)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(aes(ymin = coverage - 2 * se, ymax = coverage + 2 * se),
+                position = position_dodge(width = 0.9), width = 0.25) +
+  geom_hline(yintercept = 0.95, linetype = "dashed") +
+  facet_wrap(~method) +
+  labs(x = "True Prevalence", y = "Coverage", fill = NULL) +
+  theme_minimal()
+
+```
+
+```{r}
+complete_observed_genes <-  which( t(ex1$X) %*% (lambda == 1) > 0 )
+row_inds <- sort(as.vector(outer(complete_observed_genes, seq(0, 170000, by = 10000), "+")))
+
+ci_df[row_inds,] %>%
+  group_by(method, variant, pi_true) %>%
+  summarize(coverage = mean(covered, na.rm = TRUE), 
+            se = sqrt(coverage * (1-coverage) / n()),
+            .groups = "drop") %>%
+  ggplot(aes(x = factor(pi_true), y = coverage, fill = variant)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(aes(ymin = coverage - 2 * se, ymax = coverage + 2 * se),
+                position = position_dodge(width = 0.9), width = 0.25) +
+  geom_hline(yintercept = 0.95, linetype = "dashed") +
+  facet_wrap(~method) +
+  labs(x = "True Prevalence", y = "Coverage", fill = NULL) +
+  theme_minimal()
+
+```
+
+# Testing Robustness to Model Failures
+
+## Errors in Lambda
+
+The completeness values used come from an estimate based on $m$ core genes, where $\pi_j$ is known to be 1. This means that these used are actually a random variable based on the finite sample of core genes, with known distribution with $\widehat{\lambda_i} m \sim binom( m, \lambda_i)$. If we simulate data as before and rerun the simulations we see that the tests are mostly robust to this kind of error, even though the observed $\widehat{\lambda}_i$ can differ significantly from the underlying missingness $\lambda_i$. (N.B. the simulations of $\widehat{\lambda}_i$ below are slightly different to avoid 0s).
+
+```{r, cache = TRUE}
+set.seed(123)
+lambda <- c(rep(1, 40), rep(c(0.8, 0.6, 0.4, 0.2), each = 100))
+pi <- c(rep(1, 1000), rep(0.5, 2500), rep(0.2, 6000), rep(0.01, 500))
+m_core_genes <- 20
+ex2 <- c(
+  simulate_data(pi, lambda),
+  pi = list(pi),
+  lambda = list( (1 + rbinom(length(lambda), m_core_genes, lambda) ) / (m_core_genes + 1) )
+  )
+
+plot( lambda, ex2$lambda, type = "p", xlab = "True Completeness", ylab = "Observed Completeness", main = "Observed vs True Completeness" )
+```
+
+```{r, cache = TRUE}
+ci_df_2 <- run_cis( ex2 )
+```
+
+```{r, cache = TRUE}
+ci_df_2 %>%
+  group_by(method, variant, pi_true) %>%
+  summarize(coverage = mean(covered, na.rm = TRUE), 
+            se = sqrt(coverage * (1-coverage) / n()),
+            .groups = "drop") %>%
+  ggplot(aes(x = factor(pi_true), y = coverage, fill = variant)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(aes(ymin = coverage - 2 * se, ymax = coverage + 2 * se),
+                position = position_dodge(width = 0.9), width = 0.25) +
+  geom_hline(yintercept = 0.95, linetype = "dashed") +
+  facet_wrap(~method) +
+  labs(x = "True Prevalence", y = "Coverage", fill = NULL) +
+  theme_minimal()
+```
+
+```{r, cache = TRUE}
+ci_df_2 %>%
+  group_by(method, variant, pi_true) %>%
+  summarize(mean_length = mean(length, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = factor(pi_true), y = mean_length, fill = variant)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~method) +
+  labs(x = "True Prevalence", y = "Mean CI Length", fill = NULL) +
+  theme_minimal()
+```
+
+## Detection Bias - Per Gene Missingness
+
+Suppose that gene $j$ has a different chance of being missing than gene $j'$, with the behaviour shared across all genes. Then instead of sampling $Z_{ij} \sim Bernoulli( \lambda_i)$ we would need to consider $Z_{ij} \sim Bernoulli( f_j(\lambda_i) )$ for some per gene function $f_j$. One example of this could be:
+
+$$
+f_j(\lambda_i) = \text{ invlogit }(  \delta_j \times \text{logit}( \lambda_i ) )
+$$
+
+where each $\delta_j \sim N( 0, \sigma^2 )$ for some chosen hyper-parameter $\sigma$.
+
+```{r, cache = TRUE}
+set.seed(123)
+lambda <- c(rep(1, 40), rep(c(0.8, 0.6, 0.4, 0.2), each = 100))
+pi <- c(rep(1, 1000), rep(0.5, 2500), rep(0.2, 6000), rep(0.01, 500))
+sigma <- 0.2
+delta <- rnorm(length(pi), 0, sigma)
+
+logit <- function(x) {return(log(x / (1-x) ) )}
+inv_logit <- function(x) {return(1/(1+exp(x))) }
+
+simulate_data_biased <- function(pi, lambda, delta) {
+  n <- length(lambda)
+  p <- length(pi)
+  Y <- matrix(rbinom(n * p, 1, rep(pi, each = n)), nrow = n, ncol = p)
+  Z_probs <- inv_logit( outer( logit(lambda), delta ) )
+  Z <- matrix(rbinom(n * p, 1, Z_probs), nrow = n, ncol = p)
+  list(X = Y * Z, Y = Y, Z = Z)
+}
+
+ex3 <- c(
+  simulate_data_biased(pi, lambda, delta),
+  pi = list(pi),
+  lambda = list(lambda)
+  )
+
+ci_df_3 <- run_cis( ex3 )
+```
+
+```{r, cache = TRUE}
+ci_df_3 %>%
+  group_by(method, variant, pi_true) %>%
+  summarize(coverage = mean(covered, na.rm = TRUE), 
+            se = sqrt(coverage * (1-coverage) / n()),
+            .groups = "drop") %>%
+  ggplot(aes(x = factor(pi_true), y = coverage, fill = variant)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(aes(ymin = coverage - 2 * se, ymax = coverage + 2 * se),
+                position = position_dodge(width = 0.9), width = 0.25) +
+  geom_hline(yintercept = 0.95, linetype = "dashed") +
+  facet_wrap(~method) +
+  labs(x = "True Prevalence", y = "Coverage", fill = NULL) +
+  theme_minimal()
+```
+
+```{r, cache = TRUE}
+ci_df_3 %>%
+  group_by(method, variant, pi_true) %>%
+  summarize(mean_length = mean(length, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = factor(pi_true), y = mean_length, fill = variant)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~method) +
+  labs(x = "True Prevalence", y = "Mean CI Length", fill = NULL) +
+  theme_minimal()
+```
+
+# Combining Confidence Intervals
+
+Consider now the case that we have $k = 1, \dots, K$ sub-communities and have fitted estimates of the prevalence $\widehat{\pi}_j^{(k)}$ and $(1-\alpha)$-confidence intervals of the form $[L_j^{(k)}, U_j^{(k)}]$ for each gene $j$ in each sub-community $k$ independently. Suppose that we are interested in the prevalence of gene $j$ in some community with composition $( p_1, \dots, p_K)$ with $p_k >0$ and $\sum p_k = 1$. How should we combine these estimates and confidence intervals to understand $\pi_j$?
+
+We will run some simualtions for this set-up with 10 sub communities with differing prevalences of their genes.
+
+```{r}
+set.seed(123)
+lambda_1 <- rep(c(1.0, 0.8, 0.6, 0.4, 0.2), each = 20)
+pi_1 <- c(rep(1, 100), rep(0.4, 250), rep(0.3, 600), rep(0.02, 50))
+pop1 <- c(
+  simulate_data(pi_1, lambda_1),
+  pi = list(pi_1),
+  lambda = list(lambda_1)
+  )
+
+
+lambda_2 <- rep(c(1.0, 0.8, 0.6, 0.4, 0.2), each = 50)
+pi_2 <- c(rep(1, 100), rep(0.5, 250), rep(0.2, 600), rep(0.03, 50))
+pop2 <- c(
+  simulate_data(pi_2, lambda_2),
+  pi = list(pi_2),
+  lambda = list(lambda_2)
+  )
+
+
+lambda_3 <- rep(c(1.0, 0.8, 0.6, 0.4, 0.2), each = 10)
+pi_3 <- c(rep(1, 100), rep(0.6, 250), rep(0.15, 600), rep(0.04, 50))
+pop3 <- c(
+  simulate_data(pi_3, lambda_3),
+  pi = list(pi_3),
+  lambda = list(lambda_3)
+  )
+
+
+lambda_4 <- c(rep(1.0, 60), rep(c(0.8, 0.6, 0.4, 0.2), each = 20) )
+pi_4 <- c(rep(1, 100), rep(0.7, 250), rep(0.25, 600), rep(0.01, 50))
+pop4 <- c(
+  simulate_data(pi_4, lambda_4),
+  pi = list(pi_4),
+  lambda = list(lambda_4)
+  )
+
+
+lambda_5 <- rep(c(1.0, 0.8, 0.6, 0.4, 0.2), each = 40) 
+pi_5 <- c(rep(1, 100), rep(0.8, 250), rep(0.1, 600), rep(0.02, 50))
+pop5 <- c(
+  simulate_data(pi_5, lambda_5),
+  pi = list(pi_5),
+  lambda = list(lambda_5)
+  )
+
+```
+
+## Estimates of $\pi_j$
+
+The combined estimate of the prevalences is simply the weighted averages of the sub-community estimates: $\widehat{\pi_j} = \sum_{k = 1}^K \widehat{\pi}_j^{(k)} p_k$. We can check how well this combinations performs when estimating the
+
+```{r, cache = TRUE}
+
+pi_hats <- matrix(0, nrow = 5, ncol = length( pi_1 ) )
+
+pi_hats[1,] <- estimate_pi( pop1$X, pop1$lambda )
+pi_hats[2,] <- estimate_pi( pop2$X, pop2$lambda )
+pi_hats[3,] <- estimate_pi( pop3$X, pop3$lambda )
+pi_hats[4,] <- estimate_pi( pop4$X, pop4$lambda )
+pi_hats[5,] <- estimate_pi( pop5$X, pop5$lambda )
+```
+
+```{r}
+
+counts <- c( length(pop1$lambda),
+             length(pop2$lambda),
+             length(pop3$lambda),
+             length(pop4$lambda),
+             length(pop5$lambda) ) 
+proportions <- counts / sum(counts)
+
+pis_true <- rbind( pop1$pi, pop2$pi, pop3$pi, pop4$pi, pop5$pi  )
+pi_true <- proportions %*% pis_true
+
+pi_hat <- proportions %*% pi_hats 
+
+hist( pi_true - pi_hat, breaks = 50, xlab = "Error in prevalence estimates" )
+```
+
+## Confidence Intervals
+
+We will now demonstrate some methods of combining confidence intervals for $\pi_j$.
+
+### Combined Variance CI
+
+The first is to use the weighted average of the simple estimator on each sub-population. Writing $V_j^{(k)} = Var( \widehat{\pi}_j^{(k)} )$ we have that
+
+$$
+Var( \widehat{\pi}_j ) = Var( \sum_k \widehat{\pi}_j^{(k)} p_k ) = \sum_k p_k^2 V_j^{(k)}
+$$
+
+Thus we can take the sum $\sum_k p_k^2 \widehat{V}_j^{(k)}$ as an estimate of this variance and take Chebyshev confidence intervals around the estimates $\widehat{\pi}_j$.
+
+```{r}
+combined_cheb_ci <- function( datalist, proportions, alpha = 0.05 ) {
+  n_genes <- dim( datalist[[1]]$X )[2]
+  n_populations <- length( proportions )
+  
+  pi_hats <- matrix( 0, nrow = n_populations, ncol = n_genes )
+  var_hats <- matrix( 0, nrow = n_populations, ncol = n_genes )
+  
+  for ( k in 1:n_populations ) {
+    dataset <- datalist[[k]]
+    pi_hats[k,] <- estimate_pi( dataset$X, dataset$lambda )
+    var_hats[k,] <- estimate_pi_var( dataset$X, dataset$lambda, pi_hats[k,] )
+  }
+  
+  combined_pi <- proportions %*% pi_hats 
+  combined_vars <- ( proportions^2 ) %*% var_hats 
+  half_widths <- sqrt( combined_vars / alpha )
+  return( list(lower = as.vector( pi_hat - half_widths ), upper = as.vector( pi_hat + half_widths ) ) )
+}
+```
+
+### Guaranteed Likelihood CI and Lazy Likelihood CI
+
+Instead we can consider how to combine the "black box" $(1-\alpha)$ confidence intervals for each $\pi_j^{(k)}$ of the form $[ L_j^{(k)}, U_j^{(k)} ]$. The probability of the vector $\pi_j = [ \pi_j^{(1)}, \dots, \pi_j^{(K)}]$ being in the box $Box = \prod_{k = 1}^K [ L_j^{(k)}, U_j^{(k)} ]$ is $(1 - \alpha)^K$ by the independence of each confidence interval. Taking $L_j = \inf_{\pi \in Box} \pi p = \sum_{k =1 }^K p_k L_j^{(k)}$ and $U_j = \sup_{\pi \in Box} \pi p = \sum_{k =1 }^K p_k U_j^{(k)}$ thus gives a $(1 - \alpha)^K$ confidence interval for the combined prevalence $\pi_j$. If we want a $(1- \alpha)$-confidence interval for this prevalence, we thus therefor form the sub-population confidence intervals at the $(1 - (1-\alpha)^{1/K})$ significance level. We will call this the guaranteed likelihood confidence interval. 
+
+If we were to ignore this significance level correction we will call this the lazy likelihood confidence interval.
+
+```{r}
+combined_likelihoods <- function( datalist, proportions, alpha = 0.05, pi_grid = seq(0.000, 1.000, by = 0.001), lazy = FALSE ) {
+  n_genes <- dim( datalist[[1]]$X )[2]
+  n_populations <- length( proportions )
+  a = 1 - (1 - alpha)^{1/n_populations}
+  if (lazy) { a = alpha }
+  
+  lowers <- matrix( 0, nrow = n_populations, ncol = n_genes )
+  uppers <- matrix( 0, nrow = n_populations, ncol = n_genes )
+  
+  for ( k in 1:n_populations ) {
+    dataset <- datalist[[k]]
+    lr_ci_k <- lr_ci( dataset$X, dataset$lambda, a, pi_grid )
+    lowers[k,] <- lr_ci_k$lower
+    uppers[k,] <- lr_ci_k$upper
+  }
+  
+  combined_lower <- proportions %*% lowers 
+  combined_upper <- proportions %*% uppers 
+  return( list(lower = as.vector( combined_lower ), upper = as.vector( combined_upper ) ) )
+}
+```
+
+### Greedy Likelihood CI
+
+Lastly we can be a bit greedier that the previous method by assuming that the confidence intervals are (approximately) of the form $L_j^{(k)} = \widehat{\pi}_j^{(k)} - c_\alpha \sqrt{ \widehat{V}_j^{(k)} }$ and $U_j^{(k)} = \widehat{\pi}_j^{(k)} + c_\alpha \sqrt{ \widehat{V}_j^{(k)} }$ and then computing the equivalent esitmate and variance for the weighted average of these prevalences. We will assume that $c_\alpha$ is the $(1-\alpha/2)$-quantile of a standard normal distribution, so that $c_{0.95} \approx 1.96$.
+
+```{r}
+combined_greedy_likelihoods <- function( datalist, proportions, alpha = 0.05, pi_grid = seq(0.000, 1.000, by = 0.001) ) {
+  n_genes <- dim( datalist[[1]]$X )[2]
+  n_populations <- length( proportions )
+  
+  pi_hats <-  matrix( 0, nrow = n_populations, ncol = n_genes )
+  lowers <- matrix( 0, nrow = n_populations, ncol = n_genes )
+  uppers <- matrix( 0, nrow = n_populations, ncol = n_genes )
+  
+  for ( k in 1:n_populations ) {
+    dataset <- datalist[[k]]
+    
+    pi_hats[k,] <- estimate_pi_mle_optim( dataset$X, dataset$lambda )$pi_hats
+    lr_ci_k <- lr_ci( dataset$X, dataset$lambda, alpha, pi_grid )
+    lowers[k,] <- lr_ci_k$lower
+    uppers[k,] <- lr_ci_k$upper
+  }
+  
+  c_alpha <- qnorm(1 - alpha/2)
+  half_widths <- (uppers - lowers) / 2
+  var_hats <- ( half_widths / c_alpha )^2 
+  
+  combined_var_hats <- ( proportions^2 ) %*% var_hats
+  combined_pi_hats <- proportions %*% pi_hats
+  
+  combined_lower <- combined_pi_hats - c_alpha * sqrt( combined_var_hats )
+  combined_upper <- combined_pi_hats + c_alpha * sqrt( combined_var_hats )
+  return( list(lower = as.vector( combined_lower ), upper = as.vector( combined_upper ) ) )
+}
+```
+
+## Comparing these methods
+
+We can compare these four methods on the same dataset as above, using the same plots as in the previous sections.
+
+```{r, cache=TRUE}
+datalist = list( pop1, pop2, pop3, pop4, pop5 )
+counts <- c( length(pop1$lambda),
+             length(pop2$lambda),
+             length(pop3$lambda),
+             length(pop4$lambda),
+             length(pop5$lambda) )
+proportions <- counts / sum(counts)
+
+pis_true <- rbind( pop1$pi, pop2$pi, pop3$pi, pop4$pi, pop5$pi  )
+pi_true <- as.vector( proportions %*% pis_true )
+unique_pis <- unique( pi_true )
+
+cis_cheb <- combined_cheb_ci( datalist, proportions )
+cis_likelihood <- combined_likelihoods( datalist, proportions )
+cis_likelihood_greedy <- combined_greedy_likelihoods( datalist, proportions )
+cis_likelihood_lazy_alpha <- combined_likelihoods( datalist, proportions, lazy = TRUE )
+```
+
+```{r, cache = TRUE}
+combined_ci_df <- bind_rows(
+  make_ci_df(cis_cheb,                     "Chebyshev",      "Basic",        pi_true ),
+  make_ci_df(cis_likelihood,               "Likelihood",     "Guaranteed",   pi_true ),
+  make_ci_df(cis_likelihood_greedy,        "Likelihood",     "Greedy",       pi_true ),
+  make_ci_df(cis_likelihood_lazy_alpha,    "Likelihood",     "Lazy",         pi_true ) )
+```
+
+```{r, cache = TRUE}
+combined_ci_df %>%
+  group_by(method, variant, pi_true) %>%
+  summarize(coverage = mean(covered, na.rm = TRUE), 
+            se = sqrt(coverage * (1-coverage) / n()),
+            .groups = "drop") %>%
+  ggplot(aes(x = factor(round(pi_true,4)), y = coverage, fill = variant)) +
+  geom_col(position = "dodge") +
+  geom_errorbar(aes(ymin = coverage - 2 * se, ymax = coverage + 2 * se),
+                position = position_dodge(width = 0.9), width = 0.25) +
+  geom_hline(yintercept = 0.95, linetype = "dashed") +
+  facet_wrap(~method) +
+  labs(x = "True Prevalence", y = "Coverage", fill = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+```{r, cache = TRUE}
+combined_ci_df %>%
+  group_by(method, variant, pi_true) %>%
+  summarize(mean_length = mean(length, na.rm = TRUE), .groups = "drop") %>%
+  ggplot(aes(x = factor(round(pi_true,4)), y = mean_length, fill = variant)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~method) +
+  labs(x = "True Prevalence", y = "Mean CI Length", fill = NULL) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+```
+
+From these plots we can see that even the weakest variant of combinations of the MLE outperforms the baseline of the Chebyshev combinations. Both other variants of the MLE provide empirical, though not theoretical coverage, and shorten the confidence intervals for the combined populations. Note that even though the Greedy method has a lower than $1-\alpha$ proportion of confidence intervals containing the true parameter for the semi-rare $\pi_j$, this does not deviate from significantly from the behaviour we would expect from random chance in finite simulations under the null hypothesis of valid coverage at the $1-\alpha$ significance level. 
+
+# Conclusions
+
+Overall, using the MLE leads to lower mean squared error estimates of the underlying prevalences, and leads to narrower confidence intervals. This is mostly because it is less thrown off by low completeness genomes, and is able to still use the information in that data. However, it is affected by the cases where genes are not observed and we should consider how we want to treat these cases.
+
+```{r,echo=FALSE}
+end <- Sys.time()
+cat(stringr::str_glue("This file was run starting on {start} and took "),
+    difftime(Sys.time(), start, units = "mins"), 
+    " minutes.",
+    fill = TRUE)
+```
