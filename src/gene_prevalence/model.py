@@ -1,30 +1,115 @@
-"""Bernoulli prevalence estimation model."""
+"""Bernoulli prevalence estimation model and fit results."""
+
+from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 
 
+@dataclass(frozen=True)
+class PrevalenceFitResult:
+    """
+    Store the output of one prevalence estimation procedure.
+
+    Parameters
+    ----------
+    prevalence : pd.Series
+        Estimated prevalence values indexed by gene family.
+    estimator : {"unbiased", "mle"}
+        Name of the point estimator used to compute ``prevalence``.
+    interval_method : {"chebyshev", "likelihood_ratio"} or None
+        Name of the confidence interval method used for this fit, if any.
+    alpha : float or None
+        Significance level used for confidence interval construction. This is
+        ``None`` when no interval was requested.
+    ci_lower : pd.Series or None
+        Lower confidence bounds indexed by gene family. This is ``None`` when
+        no interval was requested.
+    ci_upper : pd.Series or None
+        Upper confidence bounds indexed by gene family. This is ``None`` when
+        no interval was requested.
+    metadata : dict[str, object]
+        Additional method-specific outputs. For example, the unbiased
+        estimator with the Chebyshev interval stores the variance estimates
+        under ``metadata["variance"]``.
+    """
+
+    prevalence: pd.Series
+    estimator: str
+    interval_method: str | None
+    alpha: float | None
+    ci_lower: pd.Series | None = None
+    ci_upper: pd.Series | None = None
+    metadata: dict[str, object] = field(default_factory=dict)
+
+    def confidence_interval(self) -> tuple[pd.Series, pd.Series]:
+        """
+        Return the fitted confidence interval bounds.
+
+        Returns
+        -------
+        tuple[pd.Series, pd.Series]
+            Lower and upper confidence bounds indexed by gene family.
+
+        Raises
+        ------
+        ValueError
+            If this fit was created without a confidence interval.
+        """
+        if self.ci_lower is None or self.ci_upper is None:
+            raise ValueError("No confidence interval was computed for this fit.")
+
+        return self.ci_lower, self.ci_upper
+
+    def summary(self) -> pd.DataFrame:
+        """
+        Return a tabular summary of the fitted quantities.
+
+        Returns
+        -------
+        pd.DataFrame
+            A DataFrame indexed by gene family. The ``prevalence`` column is
+            always present. If confidence intervals were computed, the
+            ``ci_lower`` and ``ci_upper`` columns are included. If the fit
+            metadata contains a series under the ``variance`` key, it is also
+            included as a ``variance`` column.
+        """
+        summary = pd.DataFrame({"prevalence": self.prevalence})
+
+        if self.ci_lower is not None:
+            summary["ci_lower"] = self.ci_lower
+
+        if self.ci_upper is not None:
+            summary["ci_upper"] = self.ci_upper
+
+        variance = self.metadata.get("variance")
+        if isinstance(variance, pd.Series):
+            summary["variance"] = variance
+
+        return summary
+
+
 class BernoulliPrevalenceModel:
     """
-    Estimate gene family prevalence with a Bernoulli model.
+    Estimate gene family prevalence with a Bernoulli observation model.
 
     This model assumes an observed binary presence/absence matrix ``data``,
     where rows correspond to gene families and columns correspond to genomes.
     Each genome has an associated completeness parameter ``lambda_i`` in
     ``lambdas``.
 
-    The prevalence estimator for gene family ``j`` is:
+    The Bernoulli model assumes:
 
     .. math::
 
-        \\hat{\\pi}_j = \\frac{1}{n} \\sum_{i=1}^{n} \\frac{X_{ij}}{\\lambda_i}
+        X_{ij} \\sim \\mathrm{Bernoulli}(\\pi_j \\lambda_i)
 
     where:
 
-    - ``X_{ij}`` is the observed presence/absence value for gene family ``j``
-      in genome ``i``
-    - ``\\lambda_i`` is the completeness of genome ``i``
-    - ``n`` is the number of genomes
+    - :math:`X_{ij}` is the observed presence/absence value for gene family
+      ``j`` in genome ``i``
+    - :math:`\pi_j` is the true prevalence of gene family ``j``
+    - :math:`\lambda_i` is the completeness of genome ``i``
 
     Parameters
     ----------
@@ -34,9 +119,6 @@ class BernoulliPrevalenceModel:
     lambdas : pd.Series
         A series of lambda values corresponding to the completeness of each
         genome in the dataset, with values between 0 and 1.
-    clip_max : float or None, default=1.0
-        Maximum value to clip the estimated prevalence. If set to ``None``,
-        no clipping is applied.
 
     Attributes
     ----------
@@ -44,38 +126,136 @@ class BernoulliPrevalenceModel:
         Binary presence/absence data indexed by gene family and genome.
     lambdas : pd.Series
         Genome completeness values aligned to ``data.columns``.
-    clip_max : float or None
-        Upper bound applied to prevalence estimates when requested.
-    pi_estimates_ : pd.Series
-        Estimated prevalence values, created after calling
-        :meth:`estimate_prevalence`.
-    variance_ : pd.Series
-        Estimated variances, created after calling :meth:`estimate_variance`.
     """
 
-    def __init__(self, data, lambdas, clip_max=1.0):
+    _SUPPORTED_ESTIMATORS = {"unbiased", "mle"}
+    _SUPPORTED_INTERVAL_METHODS = {"chebyshev", "likelihood_ratio"}
+    _ALLOWED_INTERVALS = {
+        "unbiased": {"chebyshev"},
+        "mle": {"likelihood_ratio"},
+    }
+
+    def __init__(self, data, lambdas):
         self.data = data.astype(int)
         self.lambdas = lambdas
-        self.clip_max = clip_max
         self._validate_inputs()
 
-    @property
-    def pi_estimates_(self):
+    def fit(
+        self,
+        *,
+        estimator: str,
+        interval_method: str | None,
+        alpha: float | None,
+        clip: bool,
+    ) -> PrevalenceFitResult:
         """
-        Return stored prevalence estimates, clipping on access when requested.
+        Fit one prevalence estimator and, optionally, one confidence interval.
+
+        The point estimator and interval method are specified independently so
+        the API can support estimator-specific interval methods today and
+        shared interval methods in the future. At present:
+
+        - ``estimator="unbiased"`` may be paired with
+          ``interval_method="chebyshev"``
+        - ``estimator="mle"`` may be paired with
+          ``interval_method="likelihood_ratio"``
+
+        The currently implemented point estimator is the unbiased estimator:
+
+        .. math::
+
+            \\hat{\\pi}_j = \\frac{1}{n} \\sum_{i=1}^{n} \\frac{X_{ij}}{\\lambda_i}
+
+        where:
+
+        - :math:`X_{ij}` is the observed binary presence/absence value for
+          gene family ``j`` in genome ``i``
+        - :math:`\lambda_i` is the completeness of genome ``i``
+        - :math:`n` is the number of genomes
+
+        The currently implemented interval method is the Chebyshev interval
+        based on the unbiased estimator variance:
+
+        .. math::
+
+            \\mathrm{Var}(\\hat{\\pi}_j)
+            = n^{-2} \\sum_{i=1}^{n}
+            \\left(1 - \\hat{\\pi}_j \\lambda_i\\right) \\frac{\\hat{\\pi}_j}{\\lambda_i}
+
+        and interval width:
+
+        .. math::
+
+            \\mathrm{CI}_j = \\sqrt{\\frac{\\mathrm{Var}(\\hat{\\pi}_j)}{\\alpha}}
+
+        Parameters
+        ----------
+        estimator : {"unbiased", "mle"}
+            Point estimator to use. Only ``"unbiased"`` is currently
+            implemented.
+        interval_method : {"chebyshev", "likelihood_ratio"} or None
+            Confidence interval method to use. Pass ``None`` to fit only the
+            point estimator.
+        alpha : float or None
+            Significance level used for confidence interval construction.
+            Provide a value satisfying ``0 < alpha < 1`` when
+            ``interval_method`` is not ``None``. Pass ``None`` when no
+            confidence interval is requested.
+        clip : bool
+            If ``True``, clip prevalence estimates and interval upper bounds
+            to at most ``1``. If ``False``, return the raw estimator output.
+
+        Returns
+        -------
+        PrevalenceFitResult
+            The prevalence estimates and any fitted interval bounds.
 
         Raises
         ------
-        AttributeError
-            If prevalence estimates have not been computed or assigned.
+        ValueError
+            If the estimator, interval method, or ``alpha`` value is invalid
+            or if the requested estimator/interval pairing is not supported.
+        NotImplementedError
+            If a valid but currently unimplemented estimator or interval
+            method is requested.
         """
-        if not hasattr(self, "_pi_estimates"):
-            raise AttributeError("pi_estimates_ has not been computed yet.")
+        self._validate_fit_arguments(
+            estimator=estimator,
+            interval_method=interval_method,
+            alpha=alpha,
+            clip=clip,
+        )
 
-        if self.clip_max is None:
-            return self._pi_estimates
+        prevalence = self._estimate_prevalence(estimator=estimator)
+        metadata: dict[str, object] = {}
+        ci_lower = None
+        ci_upper = None
 
-        return self._pi_estimates.clip(upper=self.clip_max)
+        if interval_method is not None:
+            ci_lower, ci_upper, interval_metadata = self._estimate_interval(
+                estimator=estimator,
+                interval_method=interval_method,
+                prevalence=prevalence,
+                alpha=alpha,
+            )
+            metadata.update(interval_metadata)
+
+        if clip:
+            prevalence, ci_lower, ci_upper = self._clip_outputs(
+                prevalence=prevalence,
+                ci_lower=ci_lower,
+                ci_upper=ci_upper,
+            )
+
+        return PrevalenceFitResult(
+            prevalence=prevalence,
+            estimator=estimator,
+            interval_method=interval_method,
+            alpha=alpha,
+            ci_lower=ci_lower,
+            ci_upper=ci_upper,
+            metadata=metadata,
+        )
 
     def _validate_inputs(self):
         """
@@ -93,9 +273,52 @@ class BernoulliPrevalenceModel:
         if not self.data.map(lambda x: x in [0, 1]).all().all():
             raise ValueError("Data must be binary (0 and 1).")
 
-    def estimate_prevalence(self):
+    def _validate_fit_arguments(self, estimator, interval_method, alpha, clip):
+        """Validate arguments passed to :meth:`fit`."""
+        if estimator not in self._SUPPORTED_ESTIMATORS:
+            raise ValueError(
+                f"Unsupported estimator {estimator!r}. "
+                f"Choose from {sorted(self._SUPPORTED_ESTIMATORS)}."
+            )
+
+        if interval_method is not None and interval_method not in self._SUPPORTED_INTERVAL_METHODS:
+            raise ValueError(
+                f"Unsupported interval_method {interval_method!r}. "
+                f"Choose from {sorted(self._SUPPORTED_INTERVAL_METHODS)} or None."
+            )
+
+        if not isinstance(clip, bool):
+            raise ValueError("clip must be a boolean value.")
+
+        if interval_method is None:
+            if alpha is not None:
+                raise ValueError("alpha must be None when interval_method is None.")
+        else:
+            if alpha is None:
+                raise ValueError("alpha must be provided when interval_method is not None.")
+            if not 0 < alpha < 1:
+                raise ValueError("alpha must be strictly between 0 and 1.")
+
+            allowed_intervals = self._ALLOWED_INTERVALS[estimator]
+            if interval_method not in allowed_intervals:
+                raise ValueError(
+                    f"interval_method={interval_method!r} is not supported for "
+                    f"estimator={estimator!r}."
+                )
+
+    def _estimate_prevalence(self, estimator):
+        """Dispatch to the requested prevalence estimator."""
+        if estimator == "unbiased":
+            return self._fit_unbiased()
+
+        if estimator == "mle":
+            raise NotImplementedError("The 'mle' estimator is not implemented yet.")
+
+        raise ValueError(f"Unsupported estimator {estimator!r}.")
+
+    def _fit_unbiased(self):
         """
-        Estimate and store gene family prevalence values.
+        Estimate gene family prevalence with the unbiased estimator.
 
         The estimator is:
 
@@ -110,26 +333,33 @@ class BernoulliPrevalenceModel:
         Returns
         -------
         pd.Series
-            A series of prevalence estimates indexed by gene family. Raw
-            values are stored internally and returned through
-            ``self.pi_estimates_`` with clipping applied on access.
+            Raw prevalence estimates indexed by gene family.
         """
         inverse_lambdas = 1 / self.lambdas
         weighted_data = self.data.multiply(inverse_lambdas, axis=1)
-        pi_estimates = weighted_data.mean(axis=1)
+        return weighted_data.mean(axis=1)
 
-        self._pi_estimates = pi_estimates
-        return self.pi_estimates_
+    def _estimate_interval(self, estimator, interval_method, prevalence, alpha):
+        """Dispatch to the requested confidence interval method."""
+        if interval_method == "chebyshev":
+            return self._ci_chebyshev(
+                estimator=estimator,
+                prevalence=prevalence,
+                alpha=alpha,
+            )
 
-    def estimate_variance(self):
+        if interval_method == "likelihood_ratio":
+            raise NotImplementedError(
+                "The 'likelihood_ratio' interval method is not implemented yet."
+            )
+
+        raise ValueError(f"Unsupported interval_method {interval_method!r}.")
+
+    def _ci_chebyshev(self, estimator, prevalence, alpha):
         """
-        Estimate and store the variance of each prevalence estimate.
+        Construct Chebyshev confidence intervals for the unbiased estimator.
 
-        If prevalence estimates are not already available, this method first
-        calls :meth:`estimate_prevalence`. Variance is computed from the raw
-        stored estimates before any clipping is applied on access.
-
-        The variance estimator is:
+        For gene family ``j``, the variance estimator is:
 
         .. math::
 
@@ -143,86 +373,90 @@ class BernoulliPrevalenceModel:
         - ``\\lambda_i`` is the completeness of genome ``i``
         - ``n`` is the number of genomes
 
-        Returns
-        -------
-        pd.Series
-            A series of variance estimates indexed by gene family. The same
-            values are also stored on ``self.variance_``.
-        """
-        if not hasattr(self, "pi_estimates_"):
-            self.estimate_prevalence()
-
-        raw_pi_estimates = self._pi_estimates
-        n = len(self.lambdas)
-        scaling_factor = 1 / (n**2)
-        pi_lambda_matrix = np.outer(raw_pi_estimates, 1 / self.lambdas) * (
-            1 - np.outer(raw_pi_estimates, self.lambdas)
-        )
-        variance = scaling_factor * pi_lambda_matrix.sum(axis=1)
-
-        self.variance_ = pd.Series(variance, index=raw_pi_estimates.index)
-        return self.variance_
-
-    def confidence_interval(self, alpha, return_ci_widths=False):
-        """
-        Return confidence interval bounds or widths for each prevalence estimate.
-
-        If ``self.variance_`` is not already available, this method first
-        calls :meth:`estimate_variance`.
-
-        The confidence interval width for gene family ``j`` is:
+        The Chebyshev interval width is then:
 
         .. math::
 
             \\mathrm{CI}_j = \\sqrt{\\frac{\\mathrm{Var}(\\hat{\\pi}_j)}{\\alpha}}
 
-        where:
-
-        - ``\\mathrm{Var}(\\hat{\\pi}_j)`` is the estimated variance of the
-          prevalence estimator for gene family ``j``
-        - ``\\alpha`` is the significance level (e.g. for a 95% confidence interval ``\\alpha = 0.05``)
+        and the confidence interval is
+        ``[\\hat{\\pi}_j - \\mathrm{CI}_j, \\hat{\\pi}_j + \\mathrm{CI}_j]``,
+        with lower bounds floored at ``0``.
 
         Parameters
         ----------
+        estimator : {"unbiased"}
+            Estimator associated with ``prevalence``. This argument is checked
+            defensively to ensure the method is used only with the unbiased
+            estimator.
+        prevalence : pd.Series
+            Raw prevalence estimates indexed by gene family.
         alpha : float
-            Significance level used to scale the variance estimate. Must
-            satisfy ``0 < alpha < 1``. For example, for a 95% confidence interval, 
-            set ``alpha = 0.05``.
-        return_ci_widths : bool, default=False
-            If ``True``, return only the confidence interval widths. When
-            ``False``, return lower and upper confidence bounds.
+            Significance level satisfying ``0 < alpha < 1``.
 
         Returns
         -------
-        pd.Series or tuple[pd.Series, pd.Series]
-            If ``return_ci_widths`` is ``True``, returns a series of
-            confidence interval widths indexed by gene family. Otherwise,
-            returns lower and upper bound series indexed by gene family.
-
-        Raises
-        ------
-        ValueError
-            If ``alpha`` is not strictly between 0 and 1.
+        tuple[pd.Series, pd.Series, dict[str, object]]
+            Lower bounds, upper bounds, and interval metadata. The metadata
+            dictionary contains the variance estimates under the ``variance``
+            key.
         """
-        if not 0 < alpha < 1:
-            raise ValueError("alpha must be strictly between 0 and 1.")
+        if estimator != "unbiased":
+            raise ValueError("The 'chebyshev' interval method requires estimator='unbiased'.")
 
-        if not hasattr(self, "variance_"):
-            self.estimate_variance()
+        variance = self._estimate_unbiased_variance(prevalence=prevalence)
+        ci_widths = np.sqrt(variance / alpha)
+        lower_bounds = (prevalence - ci_widths).clip(lower=0)
+        upper_bounds = prevalence + ci_widths
+        metadata = {"variance": variance}
+        return lower_bounds, upper_bounds, metadata
 
-        ci_widths = np.sqrt(self.variance_ / alpha)
-        if return_ci_widths:
-            return ci_widths
+    def _estimate_unbiased_variance(self, prevalence):
+        """
+        Estimate the variance of the unbiased prevalence estimator.
 
-        raw_pi_estimates = self._pi_estimates
-        lower_bounds = (raw_pi_estimates - ci_widths).clip(lower=0)
-        upper_bounds = raw_pi_estimates + ci_widths
+        Parameters
+        ----------
+        prevalence : pd.Series
+            Raw unbiased prevalence estimates indexed by gene family.
 
-        if self.clip_max is not None:
-            clipped_pi_estimates = self.pi_estimates_
-            upper_bounds = upper_bounds.clip(upper=self.clip_max)
-            lower_bounds = lower_bounds.where(
-                lower_bounds <= clipped_pi_estimates, clipped_pi_estimates
-            )
+        Returns
+        -------
+        pd.Series
+            Variance estimates indexed by gene family.
+        """
+        n = len(self.lambdas)
+        scaling_factor = 1 / (n**2)
+        pi_lambda_matrix = np.outer(prevalence, 1 / self.lambdas) * (
+            1 - np.outer(prevalence, self.lambdas)
+        )
+        variance = scaling_factor * pi_lambda_matrix.sum(axis=1)
+        return pd.Series(variance, index=prevalence.index)
 
-        return lower_bounds, upper_bounds
+    def _clip_outputs(self, prevalence, ci_lower, ci_upper):
+        """
+        Clip fitted outputs to the valid prevalence range when requested.
+
+        Parameters
+        ----------
+        prevalence : pd.Series
+            Raw prevalence estimates indexed by gene family.
+        ci_lower : pd.Series or None
+            Lower confidence bounds, if available.
+        ci_upper : pd.Series or None
+            Upper confidence bounds, if available.
+
+        Returns
+        -------
+        tuple[pd.Series, pd.Series or None, pd.Series or None]
+            Clipped prevalence estimates and, when present, clipped interval
+            bounds.
+        """
+        clipped_prevalence = prevalence.clip(upper=1.0)
+
+        if ci_lower is None or ci_upper is None:
+            return clipped_prevalence, ci_lower, ci_upper
+
+        clipped_upper = ci_upper.clip(upper=1.0)
+        clipped_lower = ci_lower.where(ci_lower <= clipped_prevalence, clipped_prevalence)
+        return clipped_prevalence, clipped_lower, clipped_upper
