@@ -49,7 +49,7 @@ def build_presence_absence_matrix(
     n_genes : int, default=10000
         Number of simulated gene families to generate.
     pi_vector : pd.Series or array-like of float or None, default=None
-        Gene-level prevalence values aligned to the simulated gene rows. The
+        Gene-level prevalence values aligned to the simulated gene columns. The
         vector must have length ``n_genes`` and values in ``[0, 1]``. If
         ``None``, a vector of length ``n_genes`` filled with ``0.5`` is used.
     rng : np.random.Generator or int or None, default=None
@@ -58,8 +58,8 @@ def build_presence_absence_matrix(
     Returns
     -------
     pd.DataFrame
-        A binary matrix indexed by simulated genes and columned by simulated
-        genomes, with values in ``{0, 1}``.
+        A binary matrix indexed by simulated genomes and columned by simulated
+        genes, with values in ``{0, 1}``.
     """
     if n_genomes <= 0:
         raise ValueError("n_genomes must be a positive integer.")
@@ -67,12 +67,12 @@ def build_presence_absence_matrix(
     prevalence_vector = _validate_pi_vector(n_genes=n_genes, pi_vector=pi_vector)
     rng = _coerce_rng(rng)
 
-    draws = rng.random((n_genes, n_genomes))
-    data = (draws < prevalence_vector[:, np.newaxis]).astype(int)
+    draws = rng.random((n_genomes, n_genes))
+    data = (draws < prevalence_vector[np.newaxis, :]).astype(int)
 
     genomes = [f"sim_genome_{index}" for index in range(n_genomes)]
     genes = [f"sim_gene_{index}" for index in range(n_genes)]
-    return pd.DataFrame(data, index=genes, columns=genomes)
+    return pd.DataFrame(data, index=genomes, columns=genes)
 
 
 def build_three_part_pi_vector(
@@ -205,23 +205,23 @@ def build_observed_data_matrix(
     """
     Mask a binary presence/absence matrix to simulate incomplete observations.
 
-    Each genome column is assigned a completeness value between 0 and 1. A
+    Each genome row is assigned a completeness value between 0 and 1. A
     gene that is truly present is observed independently with probability equal
     to that genome's completeness. Absent genes remain absent.
 
     Parameters
     ----------
     presence_absence_matrix : pd.DataFrame
-        Binary gene family presence/absence matrix with genes in rows and
-        genomes in columns.
+        Binary gene family presence/absence matrix with genomes in rows and
+        genes in columns.
     completeness_levels : pd.Series or array-like of float
-        Genome completeness values aligned to the columns of
+        Genome completeness values aligned to the rows of
         ``presence_absence_matrix``. Values must lie in ``[0, 1]``.
     rng : np.random.Generator or int or None, default=None
         Random generator or seed used to sample which present genes are
         observed.
     gene_biases : pd.Series or array-like of float, optional
-        Gene-specific biases in observation probabilities, aligned to the rows of
+        Gene-specific biases in observation probabilities, aligned to the columns of
         ``presence_absence_matrix``. Values must be non-negative and are interpreted 
         as multiplicative factors on the genome-level completeness values. If not
         provided, all genes are assumed to have a bias of 1.0. Values must lie in ``(0, 1]``.
@@ -250,34 +250,34 @@ def build_observed_data_matrix(
         raise ValueError("presence_absence_matrix must be binary (0 and 1).")
 
     if isinstance(completeness_levels, pd.Series):
-        if not completeness_levels.index.equals(presence_absence_matrix.columns):
+        if not completeness_levels.index.equals(presence_absence_matrix.index):
             raise ValueError(
-                "The index of completeness_levels must match the matrix columns."
+                "The index of completeness_levels must match the matrix rows."
             )
         completeness = completeness_levels.to_numpy(dtype=float)
     else:
         completeness = np.asarray(completeness_levels, dtype=float)
-        if completeness.shape != (presence_absence_matrix.shape[1],):
+        if completeness.shape != (presence_absence_matrix.shape[0],):
             raise ValueError(
-                "completeness_levels must have one value per matrix column."
+                "completeness_levels must have one value per matrix row."
             )
     if gene_biases is not None:
         if isinstance(gene_biases, pd.Series):
-            if not gene_biases.index.equals(presence_absence_matrix.index):
+            if not gene_biases.index.equals(presence_absence_matrix.columns):
                 raise ValueError(
-                    "The index of gene_biases must match the matrix rows."
+                    "The index of gene_biases must match the matrix columns."
                 )
             biases = gene_biases.to_numpy(dtype=float)
         else:
             biases = np.asarray(gene_biases, dtype=float)
-            if biases.shape != (presence_absence_matrix.shape[0],):
+            if biases.shape != (presence_absence_matrix.shape[1],):
                 raise ValueError(
-                    "gene_biases must have one value per matrix row."
+                    "gene_biases must have one value per matrix column."
                 )
         if np.any(biases <= 0) or np.any(biases > 1):
             raise ValueError("gene_biases values must be in the range (0, 1].")
     else:
-        biases = np.ones(presence_absence_matrix.shape[0], dtype=float)
+        biases = np.ones(presence_absence_matrix.shape[1], dtype=float)
 
 
     if np.any((completeness < 0) | (completeness > 1)):
@@ -287,8 +287,8 @@ def build_observed_data_matrix(
 
     if enforce_completeness:
         observation_mask = np.zeros_like(presence_absence_matrix, dtype=int)
-        for col_index, completeness_value in enumerate(completeness):
-            true_presence = presence_absence_matrix.iloc[:, col_index].to_numpy(dtype=int)
+        for row_index, completeness_value in enumerate(completeness):
+            true_presence = presence_absence_matrix.iloc[row_index, :].to_numpy(dtype=int)
             n_true_present = true_presence.sum()
             n_to_observe = int(np.round(completeness_value * n_true_present))
             if n_to_observe > 0 and n_true_present > 0:
@@ -300,11 +300,11 @@ def build_observed_data_matrix(
                     replace=False,
                     p=normed_biases,
                 )
-                observation_mask[observed_indices, col_index] = 1
+                observation_mask[row_index, observed_indices] = 1
     else:
         # simulate observation events as independent Bernoulli trials with probability 
         # equal to the completeness level multiplied by gene-specific biases (if provided)
-        adjusted_completeness = completeness * biases[:, np.newaxis]
+        adjusted_completeness = completeness[:, np.newaxis] * biases[np.newaxis, :]
         observation_mask = rng.random(presence_absence_matrix.shape) < adjusted_completeness
     
     # mask input presence/absence matrix to produce observed data

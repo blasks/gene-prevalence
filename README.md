@@ -1,5 +1,12 @@
 Methodology to estimate gene family prevalence in microbe populations using incomplete genomes (e.g. from single-cell amplified genomes or metagenome assembled genomes).
 
+Matrix convention
+-----------------
+
+All pandas matrices in this project use genomes as rows and genes as columns.
+Genome-level vectors such as completeness values align to DataFrame indexes.
+Gene-level vectors such as prevalence estimates align to DataFrame columns.
+
 Usage notes
 -----------
 

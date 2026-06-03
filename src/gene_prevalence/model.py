@@ -96,7 +96,7 @@ class BernoulliPrevalenceModel:
     Estimate gene family prevalence with a Bernoulli observation model.
 
     This model assumes an observed binary presence/absence matrix ``data``,
-    where rows correspond to gene families and columns correspond to genomes.
+    where rows correspond to genomes and columns correspond to gene families.
     Each genome has an associated completeness parameter ``lambda_i`` in
     ``lambdas``.
 
@@ -219,11 +219,11 @@ class BernoulliPrevalenceModel:
         Raises
         ------
         ValueError
-            If ``lambdas`` are not aligned to ``data.columns`` or if
+            If ``lambdas`` are not aligned to ``data.index`` or if
             ``data`` contains values other than ``0`` and ``1``.
         """
-        if not self.lambdas.index.equals(self.data.columns):
-            raise ValueError("The index of lambdas must match the columns of data.")
+        if not self.lambdas.index.equals(self.data.index):
+            raise ValueError("The index of lambdas must match the rows of data.")
 
         if not self.data.map(lambda x: x in [0, 1]).all().all():
             raise ValueError("Data must be binary (0 and 1).")
@@ -289,8 +289,8 @@ class BernoulliPrevalenceModel:
             Raw prevalence estimates indexed by gene family.
         """
         inverse_lambdas = 1 / self.lambdas
-        weighted_data = self.data.multiply(inverse_lambdas, axis=1)
-        return weighted_data.mean(axis=1)
+        weighted_data = self.data.multiply(inverse_lambdas, axis=0)
+        return weighted_data.mean(axis=0)
 
     def _fit_mle(self):
         """
@@ -302,13 +302,13 @@ class BernoulliPrevalenceModel:
             Raw MLE prevalence estimates indexed by gene family.
         """
         data = self.data.to_numpy(dtype=float)
-        mle_estimates = np.empty(data.shape[0], dtype=float)
+        mle_estimates = np.empty(data.shape[1], dtype=float)
 
-        for gene_index, data_j in enumerate(data):
+        for gene_index, data_j in enumerate(data.T):
             pi_hat, _ = self._fit_mle_gene(data_j)
             mle_estimates[gene_index] = pi_hat
 
-        return pd.Series(mle_estimates, index=self.data.index)
+        return pd.Series(mle_estimates, index=self.data.columns)
 
     def negative_log_likelihood(self, pi_j, data_j):
         """
@@ -428,8 +428,10 @@ class BernoulliPrevalenceModel:
         """
         n = len(self.lambdas)
         scaling_factor = 1 / (n**2)
-        pi_lambda_matrix = np.outer(prevalence, 1 / self.lambdas) * (
-            1 - np.outer(prevalence, self.lambdas)
+        prevalence_values = prevalence.to_numpy(dtype=float)
+        lambda_values = self.lambdas.to_numpy(dtype=float)
+        pi_lambda_matrix = np.outer(prevalence_values, 1 / lambda_values) * (
+            1 - np.outer(prevalence_values, lambda_values)
         )
         variance = scaling_factor * pi_lambda_matrix.sum(axis=1)
         return pd.Series(variance, index=prevalence.index)
@@ -461,11 +463,11 @@ class BernoulliPrevalenceModel:
         """
         data = self.data.to_numpy(dtype=float)
         cutoff = float(chi2.ppf(1.0 - alpha, df=1))
-        lower_bounds = np.empty(data.shape[0], dtype=float)
-        upper_bounds = np.empty(data.shape[0], dtype=float)
-        mle_estimates = np.empty(data.shape[0], dtype=float)
+        lower_bounds = np.empty(data.shape[1], dtype=float)
+        upper_bounds = np.empty(data.shape[1], dtype=float)
+        mle_estimates = np.empty(data.shape[1], dtype=float)
 
-        for gene_index, data_j in enumerate(data):
+        for gene_index, data_j in enumerate(data.T):
             pi_hat, nll_at_hat = self._fit_mle_gene(data_j)
             mle_estimates[gene_index] = pi_hat
 
@@ -493,7 +495,7 @@ class BernoulliPrevalenceModel:
                 upper_bounds[gene_index] = float(upper_result.root)
 
         if prevalence is None:
-            prevalence = pd.Series(mle_estimates, index=self.data.index)
+            prevalence = pd.Series(mle_estimates, index=self.data.columns)
 
         metadata = {"cutoff": cutoff, "solver": f"root_scalar_{self._LR_SOLVER_METHOD}"}
         ci_lower = pd.Series(lower_bounds, index=prevalence.index)
