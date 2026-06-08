@@ -1,7 +1,9 @@
+import numpy as np
 import pandas as pd
 import pytest
 
 from gene_prevalence.simulations import (
+    _project_row,
     build_observed_data_matrix,
     build_presence_absence_matrix,
 )
@@ -158,8 +160,35 @@ def test_build_observed_data_matrix_applies_gene_biases_without_enforcing_comple
         gene_biases=gene_biases,
     )
 
-    expected = pd.DataFrame({"gene_1": [1], "gene_2": [0], "gene_3": [1]}, index=data.index)
+    expected = pd.DataFrame({"gene_1": [1], "gene_2": [1], "gene_3": [1]}, index=data.index)
     pd.testing.assert_frame_equal(observed, expected)
+
+
+def test_build_observed_data_matrix_projects_bias_adjusted_probabilities_to_row_mean():
+    data = pd.DataFrame(
+        {"gene_1": [1], "gene_2": [1], "gene_3": [1]},
+        index=["genome_1"],
+    )
+    gene_biases = pd.Series([1.0, 0.2, 1.0], index=data.columns)
+
+    _, mask = build_observed_data_matrix(
+        data,
+        [0.5],
+        rng=0,
+        gene_biases=gene_biases,
+        return_observation_mask=True,
+    )
+
+    projected = _project_row(np.array([0.5, 0.1, 0.5]), genome_completeness=0.5)
+
+    assert projected.mean() == pytest.approx(0.5)
+    assert projected[1] < projected[0]
+    assert projected[1] < projected[2]
+    expected_mask = pd.DataFrame(
+        {"gene_1": [False], "gene_2": [False], "gene_3": [True]},
+        index=data.index,
+    )
+    pd.testing.assert_frame_equal(mask, expected_mask)
 
 
 def test_build_observed_data_matrix_enforces_expected_observed_count():

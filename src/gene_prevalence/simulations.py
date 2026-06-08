@@ -2,7 +2,7 @@
 
 import numpy as np
 import pandas as pd
-
+from scipy.optimize import brentq
 
 def _coerce_rng(rng: np.random.Generator | int | None) -> np.random.Generator:
     """Return a NumPy random generator from a seed-like input."""
@@ -31,6 +31,89 @@ def _validate_pi_vector(
         raise ValueError("pi_vector values must fall between 0 and 1.")
 
     return vector
+
+def _project_row(
+    probabilities: np.ndarray,
+    genome_completeness: float,
+    eps: float = 1e-9,
+) -> np.ndarray:
+    """
+    Project a probability row onto a target mean completeness.
+
+    Given a vector of gene observation probabilities, compute the nearest
+    probability vector in Euclidean/L2 distance whose mean equals a specified
+    genome completeness while keeping every entry within ``[eps, 1]``.
+
+    Formally, for an input vector ``p`` and target completeness ``lambda``,
+    the function solves
+
+        minimize_x    ||x - p||²
+
+        subject to    mean(x) = λ
+                      eps <= x_i <= 1
+
+    The solution is the Euclidean projection of ``p`` onto the intersection
+    of a hyperplane (fixed mean) and a box ([eps, 1]^n). Intuitively, it
+    finds the smallest possible adjustment to the gene probabilities that
+    preserves the desired overall genome completeness.
+
+    Parameters
+    ----------
+    probabilities : ndarray of shape (n,)
+        Probability of observing each gene. Values must lie in ``[eps, 1]``.
+
+    genome_completeness : float
+        Target mean probability. This represents the desired overall genome
+        completeness of the row and must satisfy
+        ``eps <= genome_completeness <= 1``.
+
+    eps : float, default=1e-9
+        Numerical lower bound used in place of a strict zero probability.
+
+    Returns
+    -------
+    ndarray of shape (n,)
+        The closest probability vector whose mean equals
+        ``genome_completeness`` and whose entries lie in [eps, 1].
+
+    Notes
+    -----
+    The optimal solution has the form
+
+        x = clip(probabilities + α, eps, 1)
+
+    for a scalar shift α chosen so that mean(x) equals the target genome
+    completeness. The shift is found efficiently using a one-dimensional
+    root-finding procedure.
+
+    Examples
+    --------
+    >>> p = np.array([0.2, 0.5, 0.9])
+    >>> x = _project_row(p, genome_completeness=0.7)
+    >>> np.round(x.mean(), 6)
+    0.7
+    """
+    probabilities = np.asarray(probabilities, dtype=float)
+
+    if np.any(probabilities < eps) or np.any(probabilities > 1):
+        raise ValueError("probabilities must lie in [eps, 1].")
+
+    if not (eps <= genome_completeness <= 1):
+        raise ValueError(
+            "genome_completeness must lie in [eps, 1]."
+        )
+
+    target_sum = probabilities.size * genome_completeness
+
+    def objective(alpha):
+        return (
+            np.clip(probabilities + alpha, eps, 1).sum()
+            - target_sum
+        )
+
+    alpha = brentq(objective, eps - 1, 1 - eps)
+
+    return np.clip(probabilities + alpha, eps, 1)
 
 
 def build_presence_absence_matrix(
@@ -205,9 +288,15 @@ def build_observed_data_matrix(
     """
     Mask a binary presence/absence matrix to simulate incomplete observations.
 
-    Each genome row is assigned a completeness value between 0 and 1. A
-    gene that is truly present is observed independently with probability equal
-    to that genome's completeness. Absent genes remain absent.
+    Each genome row is assigned a completeness value between 0 and 1. When
+    ``enforce_completeness`` is False, each row first gets a vector of
+    bias-adjusted gene observation probabilities. For rows with positive
+    completeness, that vector is projected with `_project_row` so its mean
+    matches the requested genome completeness while staying within valid
+    probability bounds. Rows with zero completeness receive all-zero
+    observation probabilities. Observation events are then sampled
+    independently from those row-wise probabilities. Absent genes remain
+    absent in the returned observed matrix.
 
     Parameters
     ----------
@@ -221,18 +310,20 @@ def build_observed_data_matrix(
         Random generator or seed used to sample which present genes are
         observed.
     gene_biases : pd.Series or array-like of float, optional
-        Gene-specific biases in observation probabilities, aligned to the columns of
-        ``presence_absence_matrix``. Values must be non-negative and are interpreted 
-        as multiplicative factors on the genome-level completeness values. If not
-        provided, all genes are assumed to have a bias of 1.0. Values must lie in ``(0, 1]``.
+        Gene-specific biases in observation probabilities, aligned to the
+        columns of ``presence_absence_matrix``. Values are interpreted as
+        multiplicative factors on the genome-level completeness values before
+        row-wise projection back to the target mean completeness for positive-
+        completeness rows. If not provided, all genes are assumed to have a
+        bias of 1.0. Values must lie in ``(0, 1]``.
     enforce_completeness : bool, default=False
         If True, enforce that the number of observed genes in each genome matches the 
         expected number given the completeness level. In this case, observation events
         are sampled from the true presence values without replacement. 
-        If False, allow for stochastic variation around the expected number of observed 
-        genes. In this case, observation events are modeled as independent Bernoulli 
-        trials with probability equal to the completeness level, regardless of the 
-        true presence values of the underlying presence/absence matrix.
+        If False, allow stochastic variation around the expected number of
+        observed genes. In this case, observation events are modeled as
+        independent Bernoulli trials using the projected, bias-adjusted
+        probabilities for each row.
     return_observation_mask : bool, default=False
         If True, return a tuple of (observation_matrix, observation_mask) where
         observation_mask is a boolean DataFrame indicating which genes were observed.
@@ -302,10 +393,24 @@ def build_observed_data_matrix(
                 )
                 observation_mask[row_index, observed_indices] = 1
     else:
-        # simulate observation events as independent Bernoulli trials with probability 
-        # equal to the completeness level multiplied by gene-specific biases (if provided)
-        adjusted_completeness = completeness[:, np.newaxis] * biases[np.newaxis, :]
-        observation_mask = rng.random(presence_absence_matrix.shape) < adjusted_completeness
+        # Build bias-adjusted observation probabilities for each row, then
+        # project them back to the requested row mean completeness.
+        projection_eps = 1e-9
+        adjusted_completeness = np.vstack(
+            [
+                np.zeros_like(biases)
+                if completeness_value == 0
+                else _project_row(
+                    np.clip(completeness_value * biases, projection_eps, 1.0),
+                    genome_completeness=completeness_value,
+                    eps=projection_eps,
+                )
+                for completeness_value in completeness
+            ]
+        )
+        observation_mask = (
+            rng.random(presence_absence_matrix.shape) < adjusted_completeness
+        )
     
     # mask input presence/absence matrix to produce observed data
     observed_data = presence_absence_matrix.to_numpy(dtype=int) * observation_mask.astype(int)
