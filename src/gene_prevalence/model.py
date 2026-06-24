@@ -98,7 +98,9 @@ class BernoulliPrevalenceModel:
     This model assumes an observed binary presence/absence matrix ``data``,
     where rows correspond to genomes and columns correspond to gene families.
     Each genome has an associated completeness parameter ``lambda_i`` in
-    ``lambdas``.
+    ``lambdas``. Optionally, each gene family may also have a mean copy
+    number ``c_j`` in ``copy_numbers``. Copy numbers are only used by the MLE
+    path.
 
     The observation model is
 
@@ -108,6 +110,13 @@ class BernoulliPrevalenceModel:
 
     where ``pi_j`` is the underlying prevalence of gene family ``j`` and
     ``lambda_i`` is the completeness of genome ``i``.
+
+    When ``copy_numbers`` are provided, the MLE path replaces ``lambda_i`` for
+    gene family ``j`` with the adjusted detection probability
+
+    .. math::
+
+        \\lambda_{ij}^{\\mathrm{adj}} = 1 - (1 - \\lambda_i)^{c_j}
     """
 
     _SUPPORTED_ESTIMATORS = {"unbiased", "mle"}
@@ -120,9 +129,10 @@ class BernoulliPrevalenceModel:
     _MLE_MAXITER = 500
     _LR_SOLVER_METHOD = "brentq"
 
-    def __init__(self, data, lambdas):
+    def __init__(self, data, lambdas, copy_numbers=None):
         self.data = data.astype(int)
         self.lambdas = lambdas
+        self.copy_numbers = copy_numbers
         self._validate_inputs()
 
     def fit(
@@ -225,8 +235,41 @@ class BernoulliPrevalenceModel:
         if not self.lambdas.index.equals(self.data.index):
             raise ValueError("The index of lambdas must match the rows of data.")
 
+        if self.copy_numbers is not None:
+            if not self.copy_numbers.index.equals(self.data.columns):
+                raise ValueError("The index of copy_numbers must match the columns of data.")
+
+            copy_number_values = self.copy_numbers.to_numpy(dtype=float)
+            if not np.isfinite(copy_number_values).all():
+                raise ValueError("copy_numbers must contain only finite values.")
+
+            if (copy_number_values < 0.0).any():
+                raise ValueError("copy_numbers must be non-negative.")
+
         if not self.data.map(lambda x: x in [0, 1]).all().all():
             raise ValueError("Data must be binary (0 and 1).")
+
+    def _get_mle_lambdas(self, gene):
+        """
+        Return the MLE detection probabilities for one gene family.
+
+        Parameters
+        ----------
+        gene : hashable
+            Gene family label from ``data.columns``.
+
+        Returns
+        -------
+        np.ndarray
+            Per-genome detection probabilities used by the MLE path for the
+            requested gene family.
+        """
+        lambdas = self.lambdas.to_numpy(dtype=float)
+        if self.copy_numbers is None:
+            return lambdas
+
+        copy_number = float(self.copy_numbers.loc[gene])
+        return 1.0 - np.power(1.0 - lambdas, copy_number)
 
     def _validate_fit_arguments(self, estimator, interval_method, alpha, clip):
         """Validate arguments passed to :meth:`fit`."""
@@ -304,13 +347,13 @@ class BernoulliPrevalenceModel:
         data = self.data.to_numpy(dtype=float)
         mle_estimates = np.empty(data.shape[1], dtype=float)
 
-        for gene_index, data_j in enumerate(data.T):
-            pi_hat, _ = self._fit_mle_gene(data_j)
+        for gene_index, (gene, data_j) in enumerate(zip(self.data.columns, data.T, strict=False)):
+            pi_hat, _ = self._fit_mle_gene(data_j, self._get_mle_lambdas(gene))
             mle_estimates[gene_index] = pi_hat
 
         return pd.Series(mle_estimates, index=self.data.columns)
 
-    def negative_log_likelihood(self, pi_j, data_j):
+    def negative_log_likelihood(self, pi_j, data_j, lambdas=None):
         """
         Evaluate the Bernoulli negative log-likelihood for one gene family.
 
@@ -320,13 +363,19 @@ class BernoulliPrevalenceModel:
             Candidate prevalence satisfying ``0 <= pi_j <= 1``.
         data_j : array-like
             Presence/absence observations for one gene family across genomes.
+        lambdas : array-like or None
+            Per-genome detection probabilities for this gene family. When
+            omitted, the raw model ``lambdas`` are used.
 
         Returns
         -------
         float
             Negative log-likelihood evaluated at ``pi_j``.
         """
-        lambdas = self.lambdas.to_numpy(dtype=float)
+        if lambdas is None:
+            lambdas = self.lambdas.to_numpy(dtype=float)
+        else:
+            lambdas = np.asarray(lambdas, dtype=float)
         observations = np.asarray(data_j, dtype=float)
         probabilities = np.clip(pi_j * lambdas, self._MLE_EPSILON, 1.0 - self._MLE_EPSILON)
         log_likelihood = np.sum(
@@ -335,7 +384,7 @@ class BernoulliPrevalenceModel:
         )
         return float(-log_likelihood)
 
-    def _fit_mle_gene(self, data_j):
+    def _fit_mle_gene(self, data_j, lambdas):
         """
         Fit the MLE and objective value for one gene family.
 
@@ -346,7 +395,7 @@ class BernoulliPrevalenceModel:
             log-likelihood value.
         """
         result = minimize_scalar(
-            fun=lambda pi_j: self.negative_log_likelihood(pi_j, data_j),
+            fun=lambda pi_j: self.negative_log_likelihood(pi_j, data_j, lambdas=lambdas),
             bounds=(0.0, 1.0),
             method="bounded",
             options={"maxiter": self._MLE_MAXITER},
@@ -354,7 +403,10 @@ class BernoulliPrevalenceModel:
 
         candidate_estimates = np.array([0.0, float(result.x), 1.0], dtype=float)
         candidate_objectives = np.array(
-            [self.negative_log_likelihood(candidate, data_j) for candidate in candidate_estimates]
+            [
+                self.negative_log_likelihood(candidate, data_j, lambdas=lambdas)
+                for candidate in candidate_estimates
+            ]
         )
         best_index = int(np.argmin(candidate_objectives))
         return float(candidate_estimates[best_index]), float(candidate_objectives[best_index])
@@ -467,12 +519,17 @@ class BernoulliPrevalenceModel:
         upper_bounds = np.empty(data.shape[1], dtype=float)
         mle_estimates = np.empty(data.shape[1], dtype=float)
 
-        for gene_index, data_j in enumerate(data.T):
-            pi_hat, nll_at_hat = self._fit_mle_gene(data_j)
+        for gene_index, (gene, data_j) in enumerate(zip(self.data.columns, data.T, strict=False)):
+            mle_lambdas = self._get_mle_lambdas(gene)
+            pi_hat, nll_at_hat = self._fit_mle_gene(data_j, mle_lambdas)
             mle_estimates[gene_index] = pi_hat
 
             def lr_gap(pi_j):
-                return 2.0 * (self.negative_log_likelihood(pi_j, data_j) - nll_at_hat) - cutoff
+                return (
+                    2.0
+                    * (self.negative_log_likelihood(pi_j, data_j, lambdas=mle_lambdas) - nll_at_hat)
+                    - cutoff
+                )
 
             if pi_hat == 0.0 or lr_gap(0.0) <= 0.0:
                 lower_bounds[gene_index] = 0.0

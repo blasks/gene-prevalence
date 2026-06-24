@@ -1,5 +1,6 @@
 import math
 
+import numpy as np
 import pandas as pd
 import pytest
 from scipy.stats import chi2
@@ -56,6 +57,49 @@ def test_model_requires_matching_lambda_index():
 
     with pytest.raises(ValueError, match="index of lambdas"):
         BernoulliPrevalenceModel(data=data, lambdas=lambdas)
+
+
+def test_model_accepts_valid_copy_numbers():
+    data = pd.DataFrame(
+        {"gene_1": [1, 0], "gene_2": [0, 1]},
+        index=["genome_1", "genome_2"],
+    )
+    lambdas = pd.Series([1.0, 0.5], index=data.index)
+    copy_numbers = pd.Series([0.0, 2.5], index=data.columns)
+
+    model = BernoulliPrevalenceModel(data=data, lambdas=lambdas, copy_numbers=copy_numbers)
+
+    pd.testing.assert_series_equal(model.copy_numbers, copy_numbers)
+
+
+def test_model_requires_matching_copy_number_index():
+    data = pd.DataFrame(
+        {"gene_1": [1, 0], "gene_2": [0, 1]},
+        index=["genome_1", "genome_2"],
+    )
+    lambdas = pd.Series([1.0, 0.5], index=data.index)
+    copy_numbers = pd.Series([1.0, 2.0], index=["gene_1", "gene_x"])
+
+    with pytest.raises(ValueError, match="index of copy_numbers"):
+        BernoulliPrevalenceModel(data=data, lambdas=lambdas, copy_numbers=copy_numbers)
+
+
+def test_model_rejects_negative_copy_numbers():
+    data = pd.DataFrame({"gene_1": [1, 0]}, index=["genome_1", "genome_2"])
+    lambdas = pd.Series([1.0, 0.5], index=data.index)
+    copy_numbers = pd.Series([-0.1], index=data.columns)
+
+    with pytest.raises(ValueError, match="copy_numbers must be non-negative"):
+        BernoulliPrevalenceModel(data=data, lambdas=lambdas, copy_numbers=copy_numbers)
+
+
+def test_model_rejects_non_finite_copy_numbers():
+    data = pd.DataFrame({"gene_1": [1, 0]}, index=["genome_1", "genome_2"])
+    lambdas = pd.Series([1.0, 0.5], index=data.index)
+    copy_numbers = pd.Series([np.inf], index=data.columns)
+
+    with pytest.raises(ValueError, match="copy_numbers must contain only finite values"):
+        BernoulliPrevalenceModel(data=data, lambdas=lambdas, copy_numbers=copy_numbers)
 
 
 def test_model_rejects_non_binary_data():
@@ -287,6 +331,34 @@ def test_fit_mle_hits_one_boundary_for_all_one_observations_with_full_completene
     pd.testing.assert_series_equal(result.prevalence, expected)
 
 
+def test_fit_mle_copy_number_of_one_matches_baseline():
+    data = pd.DataFrame(
+        {"gene_1": [1, 0, 1], "gene_2": [0, 1, 1]},
+        index=["genome_1", "genome_2", "genome_3"],
+    )
+    lambdas = pd.Series([1.0, 0.8, 0.6], index=data.index)
+    copy_numbers = pd.Series([1.0, 1.0], index=data.columns)
+
+    baseline = BernoulliPrevalenceModel(data=data, lambdas=lambdas).fit(
+        estimator="mle",
+        interval_method=None,
+        alpha=None,
+        clip=False,
+    )
+    adjusted = BernoulliPrevalenceModel(
+        data=data,
+        lambdas=lambdas,
+        copy_numbers=copy_numbers,
+    ).fit(
+        estimator="mle",
+        interval_method=None,
+        alpha=None,
+        clip=False,
+    )
+
+    pd.testing.assert_series_equal(adjusted.prevalence, baseline.prevalence)
+
+
 def test_fit_mle_remains_numerically_stable_with_mixed_incomplete_genomes():
     data = pd.DataFrame(
         {
@@ -302,6 +374,54 @@ def test_fit_mle_remains_numerically_stable_with_mixed_incomplete_genomes():
 
     assert result.prevalence.between(0.0, 1.0).all()
     assert result.prevalence.notna().all()
+
+
+def test_fit_mle_copy_numbers_can_change_one_gene_without_affecting_others():
+    data = pd.DataFrame(
+        {
+            "gene_1": [1, 0, 1, 0],
+            "gene_2": [1, 1, 0, 0],
+        },
+        index=["genome_1", "genome_2", "genome_3", "genome_4"],
+    )
+    lambdas = pd.Series([1.0, 0.8, 0.6, 0.4], index=data.index)
+    copy_numbers = pd.Series([1.0, 3.0], index=data.columns)
+
+    baseline = BernoulliPrevalenceModel(data=data, lambdas=lambdas).fit(
+        estimator="mle",
+        interval_method=None,
+        alpha=None,
+        clip=False,
+    )
+    adjusted = BernoulliPrevalenceModel(
+        data=data,
+        lambdas=lambdas,
+        copy_numbers=copy_numbers,
+    ).fit(
+        estimator="mle",
+        interval_method=None,
+        alpha=None,
+        clip=False,
+    )
+
+    assert adjusted.prevalence.loc["gene_1"] == pytest.approx(baseline.prevalence.loc["gene_1"])
+    assert adjusted.prevalence.loc["gene_2"] != pytest.approx(baseline.prevalence.loc["gene_2"])
+
+
+def test_fit_mle_higher_copy_number_reduces_prevalence_when_detection_increases():
+    data = pd.DataFrame({"gene_1": [1, 0, 1, 0]}, index=["genome_1", "genome_2", "genome_3", "genome_4"])
+    lambdas = pd.Series([0.9, 0.8, 0.7, 0.6], index=data.index)
+    baseline_model = BernoulliPrevalenceModel(data=data, lambdas=lambdas)
+    adjusted_model = BernoulliPrevalenceModel(
+        data=data,
+        lambdas=lambdas,
+        copy_numbers=pd.Series([3.0], index=data.columns),
+    )
+
+    baseline = baseline_model.fit(estimator="mle", interval_method=None, alpha=None, clip=False)
+    adjusted = adjusted_model.fit(estimator="mle", interval_method=None, alpha=None, clip=False)
+
+    assert adjusted.prevalence.iloc[0] < baseline.prevalence.iloc[0]
 
 
 def test_fit_mle_clip_is_effectively_a_no_op():
@@ -436,6 +556,36 @@ def test_negative_log_likelihood_matches_expected_formula_with_clipping():
     assert value > 0.0
 
 
+def test_negative_log_likelihood_uses_adjusted_lambdas_when_copy_numbers_are_provided():
+    data = pd.DataFrame({"gene_1": [1, 0]}, index=["genome_1", "genome_2"])
+    lambdas = pd.Series([1.0, 0.5], index=data.index)
+    copy_numbers = pd.Series([2.0], index=data.columns)
+    model = BernoulliPrevalenceModel(data=data, lambdas=lambdas, copy_numbers=copy_numbers)
+
+    observations = data["gene_1"].to_numpy(dtype=float)
+    mle_lambdas = model._get_mle_lambdas("gene_1")
+    value = model.negative_log_likelihood(0.5, observations, lambdas=mle_lambdas)
+    probabilities = np.clip(0.5 * mle_lambdas, model._MLE_EPSILON, 1.0 - model._MLE_EPSILON)
+    expected = -(math.log(probabilities[0]) + math.log(1.0 - probabilities[1]))
+
+    assert value == pytest.approx(expected)
+
+
+def test_negative_log_likelihood_copy_number_zero_remains_finite():
+    data = pd.DataFrame({"gene_1": [1, 0]}, index=["genome_1", "genome_2"])
+    lambdas = pd.Series([1.0, 0.5], index=data.index)
+    copy_numbers = pd.Series([0.0], index=data.columns)
+    model = BernoulliPrevalenceModel(data=data, lambdas=lambdas, copy_numbers=copy_numbers)
+
+    observations = data["gene_1"].to_numpy(dtype=float)
+    value = model.negative_log_likelihood(0.7, observations, lambdas=model._get_mle_lambdas("gene_1"))
+    epsilon = model._MLE_EPSILON
+    expected = -(math.log(epsilon) + math.log(1.0 - epsilon))
+
+    assert math.isfinite(value)
+    assert value == pytest.approx(expected)
+
+
 def test_private_interval_dispatch_runs_likelihood_ratio():
     data = pd.DataFrame(
         {"gene_1": [1, 0, 1]},
@@ -457,6 +607,31 @@ def test_private_interval_dispatch_runs_likelihood_ratio():
     assert metadata["solver"] == "root_scalar_brentq"
 
 
+def test_fit_with_likelihood_ratio_supports_copy_numbers():
+    data = pd.DataFrame(
+        {
+            "gene_1": [1, 0, 1, 0],
+            "gene_2": [0, 1, 1, 0],
+        },
+        index=["genome_1", "genome_2", "genome_3", "genome_4"],
+    )
+    lambdas = pd.Series([1.0, 0.8, 0.6, 0.4], index=data.index)
+    copy_numbers = pd.Series([2.0, 0.5], index=data.columns)
+    model = BernoulliPrevalenceModel(data=data, lambdas=lambdas, copy_numbers=copy_numbers)
+
+    result = model.fit(
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+        clip=False,
+    )
+
+    lower, upper = result.confidence_interval()
+    assert ((lower <= result.prevalence) & (result.prevalence <= upper)).all()
+    assert lower.between(0.0, 1.0).all()
+    assert upper.between(0.0, 1.0).all()
+
+
 def test_private_chebyshev_rejects_non_unbiased_estimator():
     data = pd.DataFrame({"gene_1": [1]}, index=["genome_1"])
     lambdas = pd.Series([1.0], index=data.index)
@@ -474,6 +649,26 @@ def test_ci_likelihood_ratio_return_prevalence_matches_plain_mle_fit():
     )
     lambdas = pd.Series([1.0, 0.8, 0.6], index=data.index)
     model = BernoulliPrevalenceModel(data=data, lambdas=lambdas)
+
+    mle_fit = model.fit(estimator="mle", interval_method=None, alpha=None, clip=False)
+    prevalence, lower, upper, metadata = model._ci_likelihood_ratio(
+        alpha=0.05,
+        return_prevalence=True,
+    )
+
+    pd.testing.assert_series_equal(prevalence, mle_fit.prevalence)
+    assert ((lower <= prevalence) & (prevalence <= upper)).all()
+    assert metadata["solver"] == "root_scalar_brentq"
+
+
+def test_ci_likelihood_ratio_return_prevalence_matches_plain_mle_fit_with_copy_numbers():
+    data = pd.DataFrame(
+        {"gene_1": [1, 0, 1], "gene_2": [0, 1, 1]},
+        index=["genome_1", "genome_2", "genome_3"],
+    )
+    lambdas = pd.Series([1.0, 0.8, 0.6], index=data.index)
+    copy_numbers = pd.Series([2.0, 0.5], index=data.columns)
+    model = BernoulliPrevalenceModel(data=data, lambdas=lambdas, copy_numbers=copy_numbers)
 
     mle_fit = model.fit(estimator="mle", interval_method=None, alpha=None, clip=False)
     prevalence, lower, upper, metadata = model._ci_likelihood_ratio(
@@ -515,3 +710,34 @@ def test_fit_results_match_transposed_legacy_fixture():
 
     pd.testing.assert_series_equal(unbiased.prevalence, pd.Series([1.0, 1.0], index=data.columns))
     pd.testing.assert_series_equal(mle.prevalence, pd.Series([1.0, 0.5], index=data.columns))
+
+
+def test_unbiased_path_is_unchanged_when_copy_numbers_are_provided():
+    data = pd.DataFrame(
+        {"gene_1": [1, 0], "gene_2": [0, 1]},
+        index=["genome_1", "genome_2"],
+    )
+    lambdas = pd.Series([1.0, 0.5], index=data.index)
+    copy_numbers = pd.Series([3.0, 0.0], index=data.columns)
+
+    baseline = BernoulliPrevalenceModel(data=data, lambdas=lambdas).fit(
+        estimator="unbiased",
+        interval_method="chebyshev",
+        alpha=0.25,
+        clip=False,
+    )
+    adjusted = BernoulliPrevalenceModel(
+        data=data,
+        lambdas=lambdas,
+        copy_numbers=copy_numbers,
+    ).fit(
+        estimator="unbiased",
+        interval_method="chebyshev",
+        alpha=0.25,
+        clip=False,
+    )
+
+    pd.testing.assert_series_equal(adjusted.prevalence, baseline.prevalence)
+    pd.testing.assert_series_equal(adjusted.ci_lower, baseline.ci_lower)
+    pd.testing.assert_series_equal(adjusted.ci_upper, baseline.ci_upper)
+    pd.testing.assert_series_equal(adjusted.metadata["variance"], baseline.metadata["variance"])
