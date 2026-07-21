@@ -3,9 +3,14 @@ import math
 import numpy as np
 import pandas as pd
 import pytest
-from scipy.stats import chi2
+from scipy.stats import chi2, norm
 
-from gene_prevalence.model import BernoulliPrevalenceModel, PrevalenceFitResult
+from gene_prevalence.model import (
+    BernoulliPrevalenceModel,
+    CombinedPrevalenceFitResult,
+    PrevalenceFitResult,
+    combine_approx_var_likelihood,
+)
 
 
 def test_fit_unbiased_returns_expected_prevalence():
@@ -741,3 +746,231 @@ def test_unbiased_path_is_unchanged_when_copy_numbers_are_provided():
     pd.testing.assert_series_equal(adjusted.ci_lower, baseline.ci_lower)
     pd.testing.assert_series_equal(adjusted.ci_upper, baseline.ci_upper)
     pd.testing.assert_series_equal(adjusted.metadata["variance"], baseline.metadata["variance"])
+
+
+def test_combined_result_rejects_unsupported_combination_method():
+    with pytest.raises(ValueError, match="Unsupported combination_method"):
+        CombinedPrevalenceFitResult(
+            prevalence=pd.Series([0.5], index=["gene_1"]),
+            estimator="mle",
+            interval_method="likelihood_ratio",
+            alpha=0.05,
+            ci_lower=pd.Series([0.3], index=["gene_1"]),
+            ci_upper=pd.Series([0.7], index=["gene_1"]),
+            combination_method="unknown",
+        )
+
+
+def test_combine_approx_var_likelihood_matches_hand_computed_values():
+    sub_1 = PrevalenceFitResult(
+        prevalence=pd.Series([0.4], index=["gene_1"]),
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+        ci_lower=pd.Series([0.2], index=["gene_1"]),
+        ci_upper=pd.Series([0.6], index=["gene_1"]),
+    )
+    sub_2 = PrevalenceFitResult(
+        prevalence=pd.Series([0.8], index=["gene_1"]),
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+        ci_lower=pd.Series([0.7], index=["gene_1"]),
+        ci_upper=pd.Series([0.9], index=["gene_1"]),
+    )
+
+    result = combine_approx_var_likelihood([sub_1, sub_2], [0.5, 0.5], clip=True)
+
+    c_alpha = norm.ppf(0.975)
+    var_1 = (0.2 / c_alpha) ** 2
+    var_2 = (0.1 / c_alpha) ** 2
+    expected_pi = 0.5 * 0.4 + 0.5 * 0.8
+    expected_var = 0.25 * (var_1 + var_2)
+    expected_lower = expected_pi - c_alpha * math.sqrt(expected_var)
+    expected_upper = expected_pi + c_alpha * math.sqrt(expected_var)
+
+    assert isinstance(result, CombinedPrevalenceFitResult)
+    assert result.combination_method == "approx_var_likelihood"
+    assert result.estimator == "mle"
+    assert result.interval_method == "likelihood_ratio"
+    assert result.alpha == 0.05
+    assert result.prevalence.loc["gene_1"] == pytest.approx(expected_pi)
+    lower, upper = result.confidence_interval()
+    assert lower.loc["gene_1"] == pytest.approx(expected_lower)
+    assert upper.loc["gene_1"] == pytest.approx(expected_upper)
+    assert result.metadata["variance"].loc["gene_1"] == pytest.approx(expected_var)
+    assert result.metadata["c_alpha"] == pytest.approx(c_alpha)
+    np.testing.assert_allclose(result.metadata["proportions"], [0.5, 0.5])
+
+
+def test_combine_approx_var_likelihood_clips_negative_lower_bound():
+    sub_1 = PrevalenceFitResult(
+        prevalence=pd.Series([0.05], index=["gene_1"]),
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+        ci_lower=pd.Series([0.0], index=["gene_1"]),
+        ci_upper=pd.Series([0.3], index=["gene_1"]),
+    )
+    sub_2 = PrevalenceFitResult(
+        prevalence=pd.Series([0.05], index=["gene_1"]),
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+        ci_lower=pd.Series([0.0], index=["gene_1"]),
+        ci_upper=pd.Series([0.3], index=["gene_1"]),
+    )
+
+    unclipped = combine_approx_var_likelihood([sub_1, sub_2], [0.5, 0.5], clip=False)
+    assert unclipped.ci_lower.loc["gene_1"] < 0.0
+
+    clipped = combine_approx_var_likelihood([sub_1, sub_2], [0.5, 0.5], clip=True)
+    assert clipped.ci_lower.loc["gene_1"] == pytest.approx(0.0)
+    assert clipped.ci_upper.loc["gene_1"] <= 1.0
+
+
+def test_combine_approx_var_likelihood_rejects_empty_results():
+    with pytest.raises(ValueError, match="at least one"):
+        combine_approx_var_likelihood([], [])
+
+
+def test_combine_approx_var_likelihood_rejects_mismatched_lengths():
+    sub_1 = PrevalenceFitResult(
+        prevalence=pd.Series([0.5], index=["gene_1"]),
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+        ci_lower=pd.Series([0.3], index=["gene_1"]),
+        ci_upper=pd.Series([0.7], index=["gene_1"]),
+    )
+
+    with pytest.raises(ValueError, match="same length"):
+        combine_approx_var_likelihood([sub_1], [0.5, 0.5])
+
+
+def test_combine_approx_var_likelihood_rejects_non_positive_proportions():
+    sub_1 = PrevalenceFitResult(
+        prevalence=pd.Series([0.5], index=["gene_1"]),
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+        ci_lower=pd.Series([0.3], index=["gene_1"]),
+        ci_upper=pd.Series([0.7], index=["gene_1"]),
+    )
+    sub_2 = PrevalenceFitResult(
+        prevalence=pd.Series([0.5], index=["gene_1"]),
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+        ci_lower=pd.Series([0.3], index=["gene_1"]),
+        ci_upper=pd.Series([0.7], index=["gene_1"]),
+    )
+
+    with pytest.raises(ValueError, match="positive"):
+        combine_approx_var_likelihood([sub_1, sub_2], [1.5, -0.5])
+
+
+def test_combine_approx_var_likelihood_rejects_proportions_not_summing_to_one():
+    sub_1 = PrevalenceFitResult(
+        prevalence=pd.Series([0.5], index=["gene_1"]),
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+        ci_lower=pd.Series([0.3], index=["gene_1"]),
+        ci_upper=pd.Series([0.7], index=["gene_1"]),
+    )
+    sub_2 = PrevalenceFitResult(
+        prevalence=pd.Series([0.5], index=["gene_1"]),
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+        ci_lower=pd.Series([0.3], index=["gene_1"]),
+        ci_upper=pd.Series([0.7], index=["gene_1"]),
+    )
+
+    with pytest.raises(ValueError, match="sum to 1"):
+        combine_approx_var_likelihood([sub_1, sub_2], [0.5, 0.6])
+
+
+def test_combine_approx_var_likelihood_rejects_non_mle_estimator():
+    sub_1 = PrevalenceFitResult(
+        prevalence=pd.Series([0.5], index=["gene_1"]),
+        estimator="unbiased",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+        ci_lower=pd.Series([0.3], index=["gene_1"]),
+        ci_upper=pd.Series([0.7], index=["gene_1"]),
+    )
+
+    with pytest.raises(ValueError, match="estimator='mle'"):
+        combine_approx_var_likelihood([sub_1], [1.0])
+
+
+def test_combine_approx_var_likelihood_rejects_non_likelihood_ratio_interval():
+    sub_1 = PrevalenceFitResult(
+        prevalence=pd.Series([0.5], index=["gene_1"]),
+        estimator="mle",
+        interval_method=None,
+        alpha=None,
+        ci_lower=pd.Series([0.3], index=["gene_1"]),
+        ci_upper=pd.Series([0.7], index=["gene_1"]),
+    )
+
+    with pytest.raises(ValueError, match="interval_method='likelihood_ratio'"):
+        combine_approx_var_likelihood([sub_1], [1.0])
+
+
+def test_combine_approx_var_likelihood_rejects_missing_confidence_interval():
+    sub_1 = PrevalenceFitResult(
+        prevalence=pd.Series([0.5], index=["gene_1"]),
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+    )
+
+    with pytest.raises(ValueError, match="fitted confidence interval"):
+        combine_approx_var_likelihood([sub_1], [1.0])
+
+
+def test_combine_approx_var_likelihood_rejects_mismatched_alpha():
+    sub_1 = PrevalenceFitResult(
+        prevalence=pd.Series([0.5], index=["gene_1"]),
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+        ci_lower=pd.Series([0.3], index=["gene_1"]),
+        ci_upper=pd.Series([0.7], index=["gene_1"]),
+    )
+    sub_2 = PrevalenceFitResult(
+        prevalence=pd.Series([0.5], index=["gene_1"]),
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.10,
+        ci_lower=pd.Series([0.3], index=["gene_1"]),
+        ci_upper=pd.Series([0.7], index=["gene_1"]),
+    )
+
+    with pytest.raises(ValueError, match="same alpha"):
+        combine_approx_var_likelihood([sub_1, sub_2], [0.5, 0.5])
+
+
+def test_combine_approx_var_likelihood_rejects_mismatched_gene_index():
+    sub_1 = PrevalenceFitResult(
+        prevalence=pd.Series([0.5], index=["gene_1"]),
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+        ci_lower=pd.Series([0.3], index=["gene_1"]),
+        ci_upper=pd.Series([0.7], index=["gene_1"]),
+    )
+    sub_2 = PrevalenceFitResult(
+        prevalence=pd.Series([0.5], index=["gene_2"]),
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=0.05,
+        ci_lower=pd.Series([0.3], index=["gene_2"]),
+        ci_upper=pd.Series([0.7], index=["gene_2"]),
+    )
+
+    with pytest.raises(ValueError, match="same gene family index"):
+        combine_approx_var_likelihood([sub_1, sub_2], [0.5, 0.5])

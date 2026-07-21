@@ -1,11 +1,12 @@
 """Bernoulli prevalence estimation model and fit results."""
 
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize_scalar, root_scalar
-from scipy.stats import chi2
+from scipy.stats import chi2, norm
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,172 @@ class PrevalenceFitResult:
             summary["variance"] = variance
 
         return summary
+
+
+@dataclass(frozen=True)
+class CombinedPrevalenceFitResult(PrevalenceFitResult):
+    """
+    Store the output of combining several sub-population fits into one.
+
+    Parameters
+    ----------
+    combination_method : {"approx_var_likelihood"}
+        Name of the method used to combine sub-population prevalence
+        estimates and confidence intervals into this result.
+    """
+
+    combination_method: str = field(kw_only=True)
+
+    _SUPPORTED_COMBINATION_METHODS = frozenset({"approx_var_likelihood"})
+
+    def __post_init__(self):
+        if self.combination_method not in self._SUPPORTED_COMBINATION_METHODS:
+            raise ValueError(
+                f"Unsupported combination_method {self.combination_method!r}. "
+                f"Choose from {sorted(self._SUPPORTED_COMBINATION_METHODS)}."
+            )
+
+
+def _validate_combine_inputs(results, proportions):
+    """Validate arguments passed to :func:`combine_approx_var_likelihood`."""
+    if len(results) == 0:
+        raise ValueError("results must contain at least one PrevalenceFitResult.")
+
+    if len(results) != len(proportions):
+        raise ValueError("results and proportions must have the same length.")
+
+    proportions_array = np.asarray(proportions, dtype=float)
+    if not np.isfinite(proportions_array).all() or (proportions_array <= 0.0).any():
+        raise ValueError("proportions must contain only positive, finite values.")
+
+    if not np.isclose(proportions_array.sum(), 1.0):
+        raise ValueError("proportions must sum to 1.")
+
+    reference = results[0]
+    for result in results:
+        if result.estimator != "mle":
+            raise ValueError(
+                "All results must use estimator='mle' to combine likelihood-ratio intervals."
+            )
+
+        if result.interval_method != "likelihood_ratio":
+            raise ValueError(
+                "All results must use interval_method='likelihood_ratio' to combine "
+                "likelihood-ratio intervals."
+            )
+
+        if result.ci_lower is None or result.ci_upper is None:
+            raise ValueError("All results must include a fitted confidence interval.")
+
+        if result.alpha != reference.alpha:
+            raise ValueError("All results must share the same alpha.")
+
+        if not result.prevalence.index.equals(reference.prevalence.index):
+            raise ValueError("All results must share the same gene family index.")
+
+
+def _clip_combined_outputs(prevalence, ci_lower, ci_upper):
+    """
+    Clip combined outputs to the valid prevalence range.
+
+    Unlike :meth:`BernoulliPrevalenceModel._clip_outputs`, this also clips
+    the lower confidence bound to ``0`` because the normal approximation
+    used by :func:`combine_approx_var_likelihood` can otherwise push it
+    negative.
+
+    Returns
+    -------
+    tuple[pd.Series, pd.Series, pd.Series]
+        Clipped prevalence estimates and interval bounds.
+    """
+    clipped_prevalence = prevalence.clip(lower=0.0, upper=1.0)
+    clipped_upper = ci_upper.clip(upper=1.0)
+    clipped_lower = ci_lower.clip(lower=0.0)
+    clipped_lower = clipped_lower.where(clipped_lower <= clipped_prevalence, clipped_prevalence)
+    return clipped_prevalence, clipped_lower, clipped_upper
+
+
+def combine_approx_var_likelihood(
+    results: Sequence[PrevalenceFitResult],
+    proportions: Sequence[float] | np.ndarray | pd.Series,
+    *,
+    clip: bool = True,
+) -> CombinedPrevalenceFitResult:
+    """
+    Combine prevalence estimates and their corresponding likelihood-ratio 
+    confidence intervals from several sub-populations into one combined estimate.
+
+    Each sub-population's likelihood-ratio confidence interval is
+    approximated as a normal interval of the form
+    ``pi_hat +/- c_alpha * sqrt(variance)`` in order to back out an implied
+    variance. Point estimates and variances are then combined as weighted
+    sums using ``proportions``, and a new normal-style interval is built
+    from the combined point estimate and variance.
+
+    Parameters
+    ----------
+    results : sequence of PrevalenceFitResult
+        Per-sub-population fits, each produced with ``estimator="mle"`` and
+        ``interval_method="likelihood_ratio"``, sharing the same ``alpha``
+        and gene family index.
+    proportions : sequence of float
+        Mixture weights ``p_k`` for each sub-population in ``results``.
+        Must be positive and sum to ``1``.
+    clip : bool
+        If ``True``, clip the combined prevalence and interval bounds to
+        ``[0, 1]``.
+
+    Returns
+    -------
+    CombinedPrevalenceFitResult
+        Combined prevalence estimate and confidence interval, with
+        ``combination_method="approx_var_likelihood"``.
+    """
+    _validate_combine_inputs(results=results, proportions=proportions)
+
+    gene_index = results[0].prevalence.index
+    alpha = results[0].alpha
+    proportions_array = np.asarray(proportions, dtype=float)
+
+    pi_hats = np.stack([result.prevalence.to_numpy(dtype=float) for result in results])
+    lowers = np.stack([result.ci_lower.to_numpy(dtype=float) for result in results])
+    uppers = np.stack([result.ci_upper.to_numpy(dtype=float) for result in results])
+
+    c_alpha = float(norm.ppf(1.0 - alpha / 2.0))
+    half_widths = (uppers - lowers) / 2.0
+    var_hats = (half_widths / c_alpha) ** 2
+
+    combined_pi = proportions_array @ pi_hats
+    combined_var = (proportions_array**2) @ var_hats
+    combined_lower = combined_pi - c_alpha * np.sqrt(combined_var)
+    combined_upper = combined_pi + c_alpha * np.sqrt(combined_var)
+
+    prevalence = pd.Series(combined_pi, index=gene_index)
+    ci_lower = pd.Series(combined_lower, index=gene_index)
+    ci_upper = pd.Series(combined_upper, index=gene_index)
+    variance = pd.Series(combined_var, index=gene_index)
+
+    if clip:
+        prevalence, ci_lower, ci_upper = _clip_combined_outputs(
+            prevalence=prevalence,
+            ci_lower=ci_lower,
+            ci_upper=ci_upper,
+        )
+
+    return CombinedPrevalenceFitResult(
+        prevalence=prevalence,
+        estimator="mle",
+        interval_method="likelihood_ratio",
+        alpha=alpha,
+        ci_lower=ci_lower,
+        ci_upper=ci_upper,
+        combination_method="approx_var_likelihood",
+        metadata={
+            "proportions": proportions_array,
+            "variance": variance,
+            "c_alpha": c_alpha,
+        },
+    )
 
 
 class BernoulliPrevalenceModel:
