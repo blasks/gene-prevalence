@@ -141,9 +141,7 @@ df.sub.v2 <- df.sub.v2 %>%
     sample_bins %>%
       select(SampleID, manual.bin),
     by = "SampleID"
-  ) %>%
-  ## REMOVE coastal deep samples early
-  filter(manual.bin != "Coastal_100to200m")
+  ) 
 
 ecotype_recipe <- df.sub.v2 %>%
   group_by(manual.bin, ProSynTax) %>%
@@ -157,6 +155,7 @@ ecotype_recipe$manual.bin <- factor(
   levels = c(
     "Coastal_upper50m",
     "Coastal_50to100m",
+    "Coastal_100to200m",
     "Trades_upper50m",
     "Trades_50to100m",
     "Trades_100to200m",
@@ -252,7 +251,7 @@ ggsave(plot = p.biome, filename = "_______.pdf",
 ## Save the % dataframe for reanalysis and plotting
 save.df <- ecotype_recipe[,c("manual.bin", "ProSynTax", "RelAbundance", "ProSynTax_plot")]
 setwd("file/path")
-write.csv(save.df, file = "Pro Ecotype Recipe Rel Abundance 8 Manual Bins Final.csv", row.names = F)
+write.csv(save.df, file = "Pro Ecotype Recipe Rel Abundance 9 Manual Bins Final.csv", row.names = F)
 
 ## ASV matrix (no aggregation into ecotype clades necessary based on prior sensitivity analysis)
 asv_mat.v2 <- df.sub.v2 %>%
@@ -341,7 +340,7 @@ adonis2(bray.v2 ~ manual.bin,
         method = "bray", 
         permutations = 999) 
 
-## Manual bins (k = 8): R2 = 0.13, p = 0.001
+## Manual bins (k = 9): R2 = 0.13, p = 0.001
 
 adonis2(bray.v2 ~ Cluster, 
         data = scores_df.v2, 
@@ -358,6 +357,7 @@ anosim(bray.v2, scores_df.v2$Cluster) ## R = 0.93, p = 0.001
 bin_cols <- c(
   "Coastal_upper50m"    = "#8c510a",
   "Coastal_50to100m"    = "#dfc27d",
+  "Coastal_100to200m"    = "#a50026",
   "Trades_upper50m"     = "#006d2c",
   "Trades_50to100m"     = "#66c2a4",
   "Trades_100to200m"    = "#88419d",
@@ -403,7 +403,7 @@ p.nmds <- ggplot(scores_df.v2, aes(NMDS1, NMDS2)) +
     hjust = 0,
     vjust = 1,
     label = paste(
-      "Biome-depth (k = 8):",
+      "Biome-depth (k = 9):",
       "PERMANOVA R² = 0.13; p = 0.001",
       "ANOSIM R = 0.20; p = 0.001",
       "",
