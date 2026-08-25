@@ -2,6 +2,7 @@
 data/
 figures/
 presentations/
+manuscript/
 *.DS_Store
 
 # Byte-compiled / optimized / DLL files
