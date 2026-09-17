@@ -3551,6 +3551,18 @@ standalone = ["Sphinx (>=5)"]
 test = ["pytest"]
 
 [[package]]
+name = "squarify"
+version = "0.4.5"
+description = "Pure Python implementation of the squarify treemap layout algorithm"
+optional = false
+python-versions = "*"
+groups = ["main"]
+files = [
+    {file = "squarify-0.4.5-py3-none-any.whl", hash = "sha256:2689b426eccf4c5aefc28c7fc5363a9e671c0391a17d86c50de8f6ea739606f3"},
+    {file = "squarify-0.4.5.tar.gz", hash = "sha256:733c9ef74cee369a83d61a050aea0812f182f0216d9b2bde76691c87443f6883"},
+]
+
+[[package]]
 name = "stack-data"
 version = "0.6.3"
 description = "Extract data from python stack frames and tracebacks for informative displays"
@@ -3842,4 +3854,4 @@ files = [
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.12,<3.14.1"
-content-hash = "9fd41e7bac6c55e7c3cbf5ed94d0415857d5f11f9ef0f252b5d3fd8dd8d5fda8"
+content-hash = "a8e5ebc4884f352db7d1573386b540f32c030add8fc5239299cbfe95958a0bdc"
