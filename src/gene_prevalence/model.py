@@ -20,7 +20,7 @@ class PrevalenceFitResult:
         Estimated prevalence values indexed by gene family.
     estimator : {"unbiased", "mle"}
         Name of the point estimator used to compute ``prevalence``.
-    interval_method : {"chebyshev", "likelihood_ratio"} or None
+    interval_method : {"chebyshev", "wald", "likelihood_ratio"} or None
         Name of the confidence interval method used for this fit, if any.
     alpha : float or None
         Significance level used for confidence interval construction. This is
@@ -287,9 +287,9 @@ class BernoulliPrevalenceModel:
     """
 
     _SUPPORTED_ESTIMATORS = {"unbiased", "mle"}
-    _SUPPORTED_INTERVAL_METHODS = {"chebyshev", "likelihood_ratio"}
+    _SUPPORTED_INTERVAL_METHODS = {"chebyshev", "wald", "likelihood_ratio"}
     _ALLOWED_INTERVALS = {
-        "unbiased": {"chebyshev"},
+        "unbiased": {"chebyshev", "wald"},
         "mle": {"likelihood_ratio"},
     }
     _MLE_EPSILON = 1e-8
@@ -315,8 +315,8 @@ class BernoulliPrevalenceModel:
 
         Supported estimator/interval pairings are:
 
-        - ``estimator="unbiased"`` with ``interval_method=None`` or
-          ``interval_method="chebyshev"``
+        - ``estimator="unbiased"`` with ``interval_method=None``,
+          ``interval_method="chebyshev"``, or ``interval_method="wald"``
         - ``estimator="mle"`` with ``interval_method=None`` or
           ``interval_method="likelihood_ratio"``
 
@@ -328,7 +328,7 @@ class BernoulliPrevalenceModel:
         ----------
         estimator : {"unbiased", "mle"}
             Point estimator to fit.
-        interval_method : {"chebyshev", "likelihood_ratio"} or None
+        interval_method : {"chebyshev", "wald", "likelihood_ratio"} or None
             Optional confidence interval method. Pass ``None`` to fit only the
             point estimator.
         alpha : float or None
@@ -586,7 +586,7 @@ class BernoulliPrevalenceModel:
         ----------
         estimator : {"unbiased", "mle"}
             Estimator associated with ``prevalence``.
-        interval_method : {"chebyshev", "likelihood_ratio"}
+        interval_method : {"chebyshev", "wald", "likelihood_ratio"}
             Confidence interval method to apply.
         prevalence : pd.Series
             Fitted prevalence estimates. For likelihood-ratio intervals this
@@ -602,6 +602,13 @@ class BernoulliPrevalenceModel:
         """
         if interval_method == "chebyshev":
             return self._ci_chebyshev(
+                estimator=estimator,
+                prevalence=prevalence,
+                alpha=alpha,
+            )
+
+        if interval_method == "wald":
+            return self._ci_wald(
                 estimator=estimator,
                 prevalence=prevalence,
                 alpha=alpha,
@@ -631,6 +638,26 @@ class BernoulliPrevalenceModel:
 
         variance = self._estimate_unbiased_variance(prevalence=prevalence)
         ci_widths = np.sqrt(variance / alpha)
+        lower_bounds = (prevalence - ci_widths).clip(lower=0)
+        upper_bounds = prevalence + ci_widths
+        metadata = {"variance": variance}
+        return lower_bounds, upper_bounds, metadata
+
+    def _ci_wald(self, estimator, prevalence, alpha):
+        """
+        Construct Wald confidence intervals for the unbiased estimator.
+
+        Returns
+        -------
+        tuple[pd.Series, pd.Series, dict[str, object]]
+            Lower bounds, upper bounds, and metadata containing the variance
+            estimate under ``"variance"``.
+        """
+        if estimator != "unbiased":
+            raise ValueError("The 'wald' interval method requires estimator='unbiased'.")
+
+        variance = self._estimate_unbiased_variance(prevalence=prevalence)
+        ci_widths = np.sqrt(variance) * norm.ppf(1 - alpha / 2)
         lower_bounds = (prevalence - ci_widths).clip(lower=0)
         upper_bounds = prevalence + ci_widths
         metadata = {"variance": variance}

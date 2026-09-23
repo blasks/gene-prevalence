@@ -169,6 +169,62 @@ def test_fit_with_chebyshev_can_return_unclipped_bounds():
     pd.testing.assert_series_equal(upper, expected_upper)
 
 
+def test_fit_with_wald_returns_expected_interval_and_variance():
+    data = pd.DataFrame(
+        {"gene_1": [1, 0], "gene_2": [0, 1]},
+        index=["genome_1", "genome_2"],
+    )
+    lambdas = pd.Series([1.0, 0.5], index=data.index)
+    model = BernoulliPrevalenceModel(data=data, lambdas=lambdas)
+
+    result = model.fit(
+        estimator="unbiased",
+        interval_method="wald",
+        alpha=0.25,
+        clip=True,
+    )
+
+    expected_prevalence = pd.Series([0.5, 1.0], index=data.columns)
+    expected_variance = pd.Series([0.25, 0.25], index=data.columns)
+    ci_width = math.sqrt(0.25) * norm.ppf(1 - 0.25 / 2)
+    expected_lower = pd.Series(
+        [0.5 - ci_width, 1.0 - ci_width], index=data.columns
+    ).clip(lower=0)
+    expected_upper = pd.Series(
+        [0.5 + ci_width, 1.0 + ci_width], index=data.columns
+    ).clip(upper=1.0)
+
+    pd.testing.assert_series_equal(result.prevalence, expected_prevalence)
+    pd.testing.assert_series_equal(result.metadata["variance"], expected_variance)
+    lower, upper = result.confidence_interval()
+    pd.testing.assert_series_equal(lower, expected_lower)
+    pd.testing.assert_series_equal(upper, expected_upper)
+
+
+def test_fit_with_wald_can_return_unclipped_bounds():
+    data = pd.DataFrame({"gene_1": [1, 1]}, index=["genome_1", "genome_2"])
+    lambdas = pd.Series([0.5, 0.5], index=data.index)
+    model = BernoulliPrevalenceModel(data=data, lambdas=lambdas)
+
+    result = model.fit(
+        estimator="unbiased",
+        interval_method="wald",
+        alpha=0.25,
+        clip=False,
+    )
+
+    expected_prevalence = pd.Series([2.0], index=data.columns)
+    expected_variance = pd.Series([0.0], index=data.columns)
+    expected_lower = pd.Series([2.0], index=data.columns)
+    expected_upper = pd.Series([2.0], index=data.columns)
+
+    pd.testing.assert_series_equal(result.prevalence, expected_prevalence)
+    pd.testing.assert_series_equal(result.metadata["variance"], expected_variance)
+    lower, upper = result.confidence_interval()
+    pd.testing.assert_series_equal(lower, expected_lower)
+    pd.testing.assert_series_equal(upper, expected_upper)
+
+
 def test_summary_includes_prevalence_interval_and_variance():
     result = PrevalenceFitResult(
         prevalence=pd.Series([0.2], index=["gene_1"]),
@@ -243,6 +299,14 @@ def test_fit_rejects_invalid_estimator_interval_pairing():
             clip=True,
         )
 
+    with pytest.raises(ValueError, match="not supported"):
+        model.fit(
+            estimator="mle",
+            interval_method="wald",
+            alpha=0.05,
+            clip=True,
+        )
+
 
 def test_fit_rejects_unknown_estimator_and_interval_method():
     data = pd.DataFrame({"gene_1": [1]}, index=["genome_1"])
@@ -253,7 +317,7 @@ def test_fit_rejects_unknown_estimator_and_interval_method():
         model.fit(estimator="median", interval_method=None, alpha=None, clip=True)
 
     with pytest.raises(ValueError, match="Unsupported interval_method"):
-        model.fit(estimator="unbiased", interval_method="wald", alpha=0.05, clip=True)
+        model.fit(estimator="unbiased", interval_method="bogus_method", alpha=0.05, clip=True)
 
 
 def test_fit_rejects_non_boolean_clip():
@@ -647,6 +711,16 @@ def test_private_chebyshev_rejects_non_unbiased_estimator():
         model._ci_chebyshev(estimator="mle", prevalence=prevalence, alpha=0.05)
 
 
+def test_private_wald_rejects_non_unbiased_estimator():
+    data = pd.DataFrame({"gene_1": [1]}, index=["genome_1"])
+    lambdas = pd.Series([1.0], index=data.index)
+    model = BernoulliPrevalenceModel(data=data, lambdas=lambdas)
+    prevalence = pd.Series([1.0], index=data.columns)
+
+    with pytest.raises(ValueError, match="requires estimator='unbiased'"):
+        model._ci_wald(estimator="mle", prevalence=prevalence, alpha=0.05)
+
+
 def test_ci_likelihood_ratio_return_prevalence_matches_plain_mle_fit():
     data = pd.DataFrame(
         {"gene_1": [1, 0, 1], "gene_2": [0, 1, 1]},
@@ -738,6 +812,37 @@ def test_unbiased_path_is_unchanged_when_copy_numbers_are_provided():
     ).fit(
         estimator="unbiased",
         interval_method="chebyshev",
+        alpha=0.25,
+        clip=False,
+    )
+
+    pd.testing.assert_series_equal(adjusted.prevalence, baseline.prevalence)
+    pd.testing.assert_series_equal(adjusted.ci_lower, baseline.ci_lower)
+    pd.testing.assert_series_equal(adjusted.ci_upper, baseline.ci_upper)
+    pd.testing.assert_series_equal(adjusted.metadata["variance"], baseline.metadata["variance"])
+
+
+def test_unbiased_wald_path_is_unchanged_when_copy_numbers_are_provided():
+    data = pd.DataFrame(
+        {"gene_1": [1, 0], "gene_2": [0, 1]},
+        index=["genome_1", "genome_2"],
+    )
+    lambdas = pd.Series([1.0, 0.5], index=data.index)
+    copy_numbers = pd.Series([3.0, 0.0], index=data.columns)
+
+    baseline = BernoulliPrevalenceModel(data=data, lambdas=lambdas).fit(
+        estimator="unbiased",
+        interval_method="wald",
+        alpha=0.25,
+        clip=False,
+    )
+    adjusted = BernoulliPrevalenceModel(
+        data=data,
+        lambdas=lambdas,
+        copy_numbers=copy_numbers,
+    ).fit(
+        estimator="unbiased",
+        interval_method="wald",
         alpha=0.25,
         clip=False,
     )
